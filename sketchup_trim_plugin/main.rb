@@ -89,11 +89,6 @@ module SketchupTrimPlugin
       view.invalidate
     end
 
-    # クロスヘアカーソルを設定
-    def onSetCursor
-      UI.set_cursor(UI::CURSOR_CROSS)
-    end
-
     # ----------------------------------------------------------------
     # onMouseMove: ホバー対象を更新してハイライトを再描画
     # ----------------------------------------------------------------
@@ -248,7 +243,12 @@ module SketchupTrimPlugin
       cut_info = find_cut_face(cutter, target, click_pt)
       if cut_info.nil?
         puts '[TrimTool] execute_trim: カット平面が見つかりませんでした'
-        Sketchup.status_text = '警告：カット平面を検出できませんでした。クリック位置を変えて再試行してください。'
+        UI.messagebox(
+          "カット平面を検出できませんでした。\n" \
+          "・カッター（境界ソリッド）とトリム対象が正しく交差しているか確認してください\n" \
+          "・クリック位置を変えて再試行してください",
+          MB_OK
+        )
         return
       end
       puts "[TrimTool] execute_trim: カット平面検出 " \
@@ -313,9 +313,6 @@ module SketchupTrimPlugin
       entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
       transform = cutter.transformation
 
-      target_bb = target.bounds
-      eps       = 1.mm  # 境界上のフェイスを取り逃さないための余裕
-
       best      = nil
       best_dist = Float::INFINITY
 
@@ -325,12 +322,7 @@ module SketchupTrimPlugin
         normal_world = face.normal.transform(transform)
         normal_world.normalize!
 
-        # ---- 条件1: フェイス中心が target の交差領域内 ----
-        next unless center_world.x.between?(target_bb.min.x - eps, target_bb.max.x + eps) &&
-                    center_world.y.between?(target_bb.min.y - eps, target_bb.max.y + eps) &&
-                    center_world.z.between?(target_bb.min.z - eps, target_bb.max.z + eps)
-
-        # ---- 条件2: 内積による方向判定 ----
+        # 内積による方向判定:
         # dot = plane_n · (click_pt - plane_pt)
         # 正値 → フェイス法線がクリック点方向を向く → 削除側の境界面
         dot = normal_world.dot(click_pt - center_world)
@@ -475,7 +467,7 @@ module SketchupTrimPlugin
     def draw_highlight(view, entity, color, line_width)
       return unless entity&.valid?
 
-      corners = entity.bounds.corners
+      corners = (0..7).map { |i| entity.bounds.corner(i) }
       pts     = []
       BB_EDGES.each { |a_idx, b_idx| pts << corners[a_idx] << corners[b_idx] }
 
