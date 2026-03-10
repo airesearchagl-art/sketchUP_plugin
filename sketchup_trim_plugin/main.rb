@@ -2,20 +2,37 @@
 
 # sketchup_trim_plugin/main.rb
 #
-# メニュー登録と TrimTool クラス本体を記述する。
+# メニュー登録と TrimTool クラス本体。
 #
 # ■ 状態遷移（ステートマシン）
 #
 #   STATE 0: :cutter_selection
-#     ユーザーがカット境界となるソリッドをクリック → STATE 1 へ
+#     1. ユーザーがカット境界となるソリッド（柱など）をクリック → STATE 1 へ
 #
 #   STATE 1: :trim_target_selection
-#     ユーザーが削除したい端部をクリック → ブーリアン演算 → STATE 1 に留まる
-#     （同じカッターで連続トリム可能。ESC で STATE 0 へ戻る）
+#     2. ユーザーが切り落とす側の端部をクリック → ハーフスペースカッター法で演算 → STATE 1 維持
+#        （同じカッターで連続トリム可能。ESC で STATE 0 へ戻る）
 #
-# ■ ハイライト色の意味
-#   シアン  : カット境界ソリッド（STATE 0 ホバー / STATE 1 選択済み固定表示）
-#   オレンジ: トリム可能なターゲット（交差あり）
+# ■ アーキテクチャの要点（Phase 3）
+#   @cutter は「カット平面特定のための参照専用」。ブーリアン演算には渡さない。
+#   演算には一時生成した half_space_box を使い、subtract 後に両者（target + box）は消える。
+#   → @cutter（柱など境界ソリッド）は絶対に保持される。
+#
+# ■ ハーフスペースカッター法のコアロジック
+#
+#   find_cut_face:
+#     カッターの各フェイスの法線ベクトル plane_n と
+#     クリック点への方向ベクトル (click_pt - plane_pt) の内積を計算。
+#     内積 > 0 ならそのフェイスが「削除側を向いている」ことを示す。
+#
+#   build_half_space_cutter:
+#     dot = plane_n.dot(click_pt - plane_pt) の値で延伸距離を動的に決定。
+#     内積の絶対値 = カット平面からクリック点までの射影距離。
+#     この距離の2倍 + 余裕 を延伸長とすることで T字・貫通どちらにも対応。
+#
+# ■ ハイライト色
+#   シアン  : カット境界ソリッド（STATE 0 ホバー / STATE 1 固定表示）
+#   オレンジ: トリム可能なターゲット（カッターと交差あり）
 #   紫      : 交差が検出できないターゲット（操作不可）
 #   グレー  : 非マニフォールドのソリッド（操作不可）
 
@@ -35,23 +52,17 @@ module SketchupTrimPlugin
   end
 
   # ================================================================
-  # TrimTool – 交差ソリッドのトリムツール
+  # TrimTool – 交差ソリッドのトリムツール（ハーフスペースカッター法）
   # ================================================================
   class TrimTool
     # ---- ハイライト色定数 ----------------------------------------
-    # STATE 0: ホバー中のカッター候補
-    COLOR_CUTTER_HOVER    = Sketchup::Color.new(  0, 210, 255, 180)
-    # STATE 1: 選択済みカッター（常時表示）
-    COLOR_CUTTER_SELECTED = Sketchup::Color.new(  0, 210, 255, 230)
-    # STATE 1: ホバー中の有効ターゲット（カッターと交差あり）
-    COLOR_TARGET_VALID    = Sketchup::Color.new(255, 140,   0, 180)
-    # STATE 1: ホバー中の無効ターゲット（カッターと交差なし）
-    COLOR_TARGET_INVALID  = Sketchup::Color.new(160,   0, 200, 180)
-    # 非マニフォールド（選択不可）
-    COLOR_NON_MANIFOLD    = Sketchup::Color.new(140, 140, 140, 120)
+    COLOR_CUTTER_HOVER    = Sketchup::Color.new(  0, 210, 255, 180)  # シアン（STATE 0 ホバー）
+    COLOR_CUTTER_SELECTED = Sketchup::Color.new(  0, 210, 255, 230)  # シアン（STATE 1 固定）
+    COLOR_TARGET_VALID    = Sketchup::Color.new(255, 140,   0, 180)  # オレンジ（交差あり）
+    COLOR_TARGET_INVALID  = Sketchup::Color.new(160,   0, 200, 180)  # 紫（交差なし）
+    COLOR_NON_MANIFOLD    = Sketchup::Color.new(140, 140, 140, 120)  # グレー（非マニフォールド）
 
-    # BoundingBox の 12 辺を構成するコーナーインデックスペア
-    # corners 配列は Geom::BoundingBox#corners の順序に準拠
+    # BoundingBox の 12 辺（corners インデックスペア）
     BB_EDGES = [
       [0, 1], [1, 3], [3, 2], [2, 0],  # 底面
       [4, 5], [5, 7], [7, 6], [6, 4],  # 上面
@@ -73,10 +84,14 @@ module SketchupTrimPlugin
       view.invalidate
     end
 
-    # ツールが前面に戻ったとき（ダイアログを閉じた後など）
     def resume(view)
       Sketchup.status_text = status_message
       view.invalidate
+    end
+
+    # クロスヘアカーソルを設定
+    def onSetCursor
+      UI.set_cursor(UI::CURSOR_CROSS)
     end
 
     # ----------------------------------------------------------------
@@ -90,9 +105,7 @@ module SketchupTrimPlugin
       case @state
       when :cutter_selection
         @hovered = hovered
-        if @hovered
-          puts "[TrimTool] STATE 0 hover: #{entity_label(@hovered)}"
-        end
+        puts "[TrimTool] STATE 0 hover: #{entity_label(@hovered)}" if @hovered
 
       when :trim_target_selection
         if hovered && hovered != @cutter
@@ -120,8 +133,14 @@ module SketchupTrimPlugin
       case @state
       when :cutter_selection
         on_cutter_click(entity, view)
+
       when :trim_target_selection
-        on_trim_target_click(entity, view)
+        # STATE 1: クリック点をワールド座標で取得（ハーフスペースカッター法に使用）
+        ip = Sketchup::InputPoint.new
+        ip.pick(view, x, y)
+        click_pt = ip.position  # Geom::Point3d（ワールド座標）
+        puts "[TrimTool] STATE 1 click_pt=#{click_pt}"
+        on_trim_target_click(entity, click_pt, view)
       end
 
       Sketchup.status_text = status_message
@@ -132,7 +151,7 @@ module SketchupTrimPlugin
     # onKeyDown: ESC で前の状態に戻る
     # ----------------------------------------------------------------
     def onKeyDown(key, _repeat, _flags, view)
-      return unless key == 27 # ESC
+      return unless key == 27  # ESC
 
       case @state
       when :cutter_selection
@@ -184,9 +203,9 @@ module SketchupTrimPlugin
     end
 
     # ----------------------------------------------------------------
-    # STATE 1 クリック処理: トリム対象を指定してブーリアン演算を実行
+    # STATE 1 クリック処理: トリム対象とクリック点を受け取りブーリアン演算を実行
     # ----------------------------------------------------------------
-    def on_trim_target_click(entity, view)
+    def on_trim_target_click(entity, click_pt, view)
       if entity.nil?
         puts '[TrimTool] STATE 1 click: ソリッドに当たりませんでした（スキップ）'
         return
@@ -210,41 +229,68 @@ module SketchupTrimPlugin
       end
 
       puts "[TrimTool] STATE 1 click: トリム実行 target=#{entity_label(entity)}"
-      execute_trim(entity, @cutter, view)
+      execute_trim(entity, @cutter, click_pt, view)
     end
 
     # ----------------------------------------------------------------
-    # ブーリアン演算の実行
+    # ブーリアン演算の実行（Phase 3: ハーフスペースカッター法）
     #
-    # Phase 1（現在）:
-    #   target.trim(cutter) によるT字交差向けの直接トリム。
-    #   trim は cutter を保持するため、同じカッターで連続トリムが可能。
-    #
-    # Phase 3（予定）:
-    #   ハーフスペースカッター法に置き換え（貫通交差にも対応）。
+    # 設計の核心:
+    #   @cutter（柱など境界ソリッド）は find_cut_face のカット平面特定にのみ使用。
+    #   実際のブーリアン演算では一時生成した half_space_box で subtract を行う。
+    #   → @cutter は演算に関与しないため絶対に保持される（連続トリムが可能）
+    #   → subtract 成功後、target と half_space_box は両方削除されて result が返る
     # ----------------------------------------------------------------
-    def execute_trim(target, cutter, view)
+    def execute_trim(target, cutter, click_pt, view)
       model = Sketchup.active_model
+
+      # ---- Step 1: カット平面の特定（内積による方向判定） -----
+      cut_info = find_cut_face(cutter, target, click_pt)
+      if cut_info.nil?
+        puts '[TrimTool] execute_trim: カット平面が見つかりませんでした'
+        Sketchup.status_text = '警告：カット平面を検出できませんでした。クリック位置を変えて再試行してください。'
+        return
+      end
+      puts "[TrimTool] execute_trim: カット平面検出 " \
+           "center=#{cut_info[:center].to_s.gsub("\n", '')} " \
+           "dot=#{cut_info[:dot].round(4)}"
+
+      # ---- Step 2〜4: カッターボックス生成 → subtract → Undo ラップ ----
       model.start_operation('Trim Solid', true)
+      half_space = nil
 
       begin
-        puts '[TrimTool] execute_trim: target.trim(cutter) 実行中...'
+        # カット平面の法線方向（削除側）へ延伸するカッターボックスを生成
+        half_space = build_half_space_cutter(
+          model,
+          cut_info[:center],
+          cut_info[:normal],
+          target,
+          click_pt
+        )
+        raise 'ハーフスペースカッターの生成に失敗しました' if half_space.nil?
 
-        # NOTE: Group#trim は cutter を保持しつつ target をトリムした新グループを返す。
-        #       戻り値が nil の場合は演算失敗（非マニフォールドなど）。
-        result = target.trim(cutter)
+        puts '[TrimTool] execute_trim: target.subtract(half_space) 実行中...'
+
+        # NOTE: subtract は target と half_space の両方を削除して result（新グループ）を返す。
+        #       @cutter はこの演算に渡さないため保持される。
+        result    = target.subtract(half_space)
+        half_space = nil  # subtract 成功時は既に削除済み
 
         raise 'ブーリアン演算が失敗しました（ソリッドが非マニフォールドの可能性があります）' if result.nil?
 
         model.commit_operation
         puts "[TrimTool] execute_trim: 完了 result=#{entity_label(result)}"
 
-        # 同じカッターで続けてトリムできるよう STATE 1 を維持（@cutter はそのまま）
+        # STATE 1 を維持して同じカッターで連続トリムを可能にする
         @hovered            = nil
         @hovered_intersects = false
         Sketchup.status_text = 'トリム完了。引き続き同じカッターで別の端部をトリムできます。ESC でカッター再選択。'
+
       rescue RuntimeError => e
+        # abort_operation により操作内のすべての変更（half_space 生成を含む）がロールバックされる
         model.abort_operation
+        half_space = nil
         puts "[TrimTool] execute_trim エラー: #{e.message}"
         UI.messagebox("トリム失敗：\n#{e.message}", MB_OK)
       end
@@ -253,16 +299,131 @@ module SketchupTrimPlugin
     end
 
     # ----------------------------------------------------------------
-    # PickHelper からソリッドエンティティ（Group/ComponentInstance）を取得
+    # カット平面の特定
     #
-    # best_picked が Face/Edge を返す場合（グループ編集モード中など）は
-    # パスを辿って最も近い親グループを返す。
+    # カッターソリッドのフェイス群を走査し、以下の条件を満たすフェイスを選択:
+    #   条件1: フェイス中心が target の BoundingBox 内（交差領域チェック）
+    #   条件2: plane_n.dot(click_pt - plane_pt) > 0
+    #          （フェイス法線がクリック点方向を向く = 削除側の境界面）
+    # 条件を満たす候補の中からクリック点に最も近いフェイスを返す。
+    #
+    # @return [Hash] { center: Geom::Point3d, normal: Geom::Vector3d, dot: Float } or nil
+    # ----------------------------------------------------------------
+    def find_cut_face(cutter, target, click_pt)
+      entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
+      transform = cutter.transformation
+
+      target_bb = target.bounds
+      eps       = 1.mm  # 境界上のフェイスを取り逃さないための余裕
+
+      best      = nil
+      best_dist = Float::INFINITY
+
+      entities.grep(Sketchup::Face).each do |face|
+        # フェイスの中心と法線をワールド座標に変換
+        center_world = face.bounds.center.transform(transform)
+        normal_world = face.normal.transform(transform)
+        normal_world.normalize!
+
+        # ---- 条件1: フェイス中心が target の交差領域内 ----
+        next unless center_world.x.between?(target_bb.min.x - eps, target_bb.max.x + eps) &&
+                    center_world.y.between?(target_bb.min.y - eps, target_bb.max.y + eps) &&
+                    center_world.z.between?(target_bb.min.z - eps, target_bb.max.z + eps)
+
+        # ---- 条件2: 内積による方向判定 ----
+        # dot = plane_n · (click_pt - plane_pt)
+        # 正値 → フェイス法線がクリック点方向を向く → 削除側の境界面
+        dot = normal_world.dot(click_pt - center_world)
+        next if dot <= 0.0
+
+        dist = center_world.distance(click_pt)
+        if dist < best_dist
+          best_dist = dist
+          best = { center: center_world, normal: normal_world, dot: dot }
+        end
+      end
+
+      face_count = entities.grep(Sketchup::Face).count
+      puts "[TrimTool] find_cut_face: #{best ? '検出成功' : '候補なし'} " \
+           "(フェイス数=#{face_count})"
+      best
+    end
+
+    # ----------------------------------------------------------------
+    # ハーフスペースカッターボックスの生成
+    #
+    # カット平面（plane_pt, plane_n）から削除側（plane_n 方向）へ延伸する
+    # 直方体ソリッドグループを生成して返す。
+    #
+    # 延伸距離の動的決定:
+    #   dot = plane_n.dot(click_pt - plane_pt) → カット平面からクリック点までの射影距離
+    #   extend_dist = max(dot * 2 + 5m, target対角線 * 3 + 10m)
+    #   これにより T字・貫通どちらの交差形状にも対応できる。
+    #
+    # @return [Sketchup::Group] カッターボックス、または nil（失敗時）
+    # ----------------------------------------------------------------
+    def build_half_space_cutter(model, plane_pt, plane_n, target, click_pt)
+      bb = target.bounds
+
+      # 内積による延伸方向の確認と延伸距離の動的決定
+      # dot = plane_n · (click_pt - plane_pt)
+      # 正値であることは find_cut_face で保証済みだが、安全弁として反転チェックを行う
+      dot = plane_n.dot(click_pt - plane_pt)
+      if dot <= 0.0
+        puts "[TrimTool] build_half_space_cutter: 警告 dot=#{dot.round(4)}, 法線を反転"
+        plane_n.reverse!
+        dot = -dot
+      end
+
+      # 延伸距離: クリック点までの射影距離の2倍 + target全体をカバーする保険距離
+      target_diag  = bb.min.distance(bb.max)
+      extend_dist  = [dot * 2 + 5.m, target_diag * 3 + 10.m].max
+      # 底面サイズ: target の対角線の3倍（切断面が確実に target 全断面を覆う）
+      half_size    = [target_diag * 3, 5.m].max
+
+      # plane_n に垂直な 2 軸ベクトルを計算（底面の正方形を定義するため）
+      perp1 = plane_n.perpendicular_vector  # 単位ベクトル
+      perp2 = plane_n.cross(perp1)          # 単位ベクトル（plane_n と perp1 に垂直）
+      perp1.length = half_size              # half_size の長さにスケール
+      perp2.length = half_size
+
+      # カット平面上の大きな正方形の 4 頂点
+      # ※ 新グループは単位変換（origin）で生成されるため、ワールド座標 = ローカル座標
+      pts = [
+        plane_pt.offset(perp1).offset(perp2),
+        plane_pt.offset(perp1.reverse).offset(perp2),
+        plane_pt.offset(perp1.reverse).offset(perp2.reverse),
+        plane_pt.offset(perp1).offset(perp2.reverse),
+      ]
+
+      g    = model.active_entities.add_group
+      face = g.entities.add_face(pts)
+
+      # フェイス法線を plane_n（削除側）に揃える
+      face.reverse! if face.normal.dot(plane_n) < 0
+
+      # plane_n 方向（削除側）へ extend_dist 分押し出してソリッドボックスを完成
+      face.pushpull(extend_dist)
+
+      puts "[TrimTool] build_half_space_cutter: 完了 " \
+           "dot=#{dot.round(2)} " \
+           "extend_dist=#{extend_dist.to_f.round(1)}in " \
+           "half_size=#{half_size.to_f.round(1)}in"
+      g
+
+    rescue StandardError => e
+      puts "[TrimTool] build_half_space_cutter エラー: #{e.message}"
+      g.erase! if g&.valid?
+      nil
+    end
+
+    # ----------------------------------------------------------------
+    # PickHelper からソリッドエンティティ（Group/ComponentInstance）を取得
     # ----------------------------------------------------------------
     def pick_solid(ph)
       entity = ph.best_picked
       return nil unless entity
 
-      # Group / ComponentInstance 以外（Face, Edge など）が返された場合はパスを辿る
       unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
         entity = find_enclosing_solid(ph)
       end
@@ -323,7 +484,6 @@ module SketchupTrimPlugin
       view.draw(GL_LINES, pts)
     end
 
-    # ホバー中エンティティに適用するハイライト色を返す
     def hovered_color
       return COLOR_NON_MANIFOLD unless @hovered && manifold?(@hovered)
 
@@ -353,9 +513,9 @@ module SketchupTrimPlugin
     def status_message
       case @state
       when :cutter_selection
-        '【カッター選択】カット境界となるソリッドをクリックしてください  |  ESC: ツール終了'
+        '【トリム】1. カットの基準となる境界ソリッド（柱など）をクリックしてください'
       when :trim_target_selection
-        '【端部選択】削除する側の端部をクリックしてください  |  ESC: カッター再選択'
+        '【トリム】2. 切り落として削除したいソリッドの端部をクリックしてください'
       else
         '処理中...'
       end
