@@ -31,11 +31,13 @@
 #     この距離の2倍 + 余裕 を延伸長とすることで T字・貫通どちらにも対応。
 #
 # ■ ハイライト色（Phase 5 追加）
-#   シアン  : カット境界ソリッド（STATE 0 ホバー / STATE 1 固定表示）
-#   オレンジ: トリム可能なターゲット（保持される側のエッジ / カッターと交差あり）
-#   赤      : 削除プレビュー（ホバー時にカット平面の削除側エッジを強調）
-#   紫      : 交差が検出できないターゲット（操作不可）
-#   グレー  : 非マニフォールドのソリッド（操作不可）
+#   シアン       : カット境界ソリッド（STATE 0 ホバー / STATE 1 固定表示）
+#   オレンジ     : トリム可能なターゲット（通常ホバー / カッターと交差あり）
+#   グレー細線   : カット平面プレビュー時のターゲット BB（形状把握用）
+#   半透明赤面   : カット境界を示す平面ポリゴン（どこで切れるかを可視化）
+#   赤アウトライン: カット平面の縁取り線
+#   紫           : 交差が検出できないターゲット（操作不可）
+#   グレー       : 非マニフォールドのソリッド（操作不可）
 
 module SketchupTrimPlugin
   # ----------------------------------------------------------------
@@ -69,7 +71,9 @@ module SketchupTrimPlugin
     COLOR_TARGET_VALID    = Sketchup::Color.new(255, 140,   0, 180)  # オレンジ（保持側 / 交差あり）
     COLOR_TARGET_INVALID  = Sketchup::Color.new(160,   0, 200, 180)  # 紫（交差なし）
     COLOR_NON_MANIFOLD    = Sketchup::Color.new(140, 140, 140, 120)  # グレー（非マニフォールド）
-    COLOR_DELETE_PREVIEW  = Sketchup::Color.new(220,  30,  30, 230)  # 赤（削除プレビュー）
+    COLOR_BB_PREVIEW      = Sketchup::Color.new( 80,  80,  80, 160)  # グレー細線（カット面プレビュー時の BB）
+    COLOR_CUT_PLANE_FILL  = Sketchup::Color.new(255,   0,   0, 100)  # 半透明赤（カット境界面ポリゴン）
+    COLOR_CUT_PLANE_EDGE  = Sketchup::Color.new(220,  30,  30, 220)  # 赤（カット境界面アウトライン）
 
     # BoundingBox の 12 辺（corners インデックスペア）
     BB_EDGES = [
@@ -85,6 +89,20 @@ module SketchupTrimPlugin
     def activate
       puts '[TrimTool] activate: ツール起動'
       reset_state
+
+      # 起動時に有効なソリッドが1つだけ選択されていれば自動的にカッターとして登録し STATE 1 へ
+      sel = Sketchup.active_model.selection
+      if sel.length == 1
+        candidate = sel.first
+        if (candidate.is_a?(Sketchup::Group) || candidate.is_a?(Sketchup::ComponentInstance)) &&
+           manifold?(candidate)
+          puts "[TrimTool] activate: 選択済みソリッドをカッターとして自動登録 → #{entity_label(candidate)}"
+          @cutter = candidate
+          @state  = :trim_target_selection
+          sel.clear
+        end
+      end
+
       Sketchup.status_text = status_message
     end
 
@@ -185,8 +203,8 @@ module SketchupTrimPlugin
     # draw: バウンディングボックスのエッジでハイライト描画
     #
     # STATE 1 でターゲット候補にホバー中かつ preview_cut_info がある場合は、
-    # draw_split_highlight によりカット平面の削除側（赤）と保持側（オレンジ）を
-    # 色分け描画してユーザーに削除プレビューを提示する。
+    # draw_cut_plane_preview により「どこで切れるか」を半透明赤ポリゴンで可視化する。
+    # ターゲット BB はグレー細線のみとし、カット面（刃）で削除位置を表現。
     # ※ draw コールバック内でのみ有効
     # ----------------------------------------------------------------
     def draw(view)
@@ -194,8 +212,8 @@ module SketchupTrimPlugin
 
       if @hovered
         if @state == :trim_target_selection && @hovered_intersects && @preview_cut_info
-          # 削除プレビューモード: エッジをカット平面で赤（削除側）とオレンジ（保持側）に分割描画
-          draw_split_highlight(view, @hovered, @preview_cut_info)
+          # カット平面プレビューモード: BB はグレー細線 + カット境界を赤ポリゴンで表示
+          draw_cut_plane_preview(view, @hovered, @preview_cut_info)
         else
           draw_highlight(view, @hovered, hovered_color, 2)
         end
@@ -519,48 +537,46 @@ module SketchupTrimPlugin
     end
 
     # ----------------------------------------------------------------
-    # 削除プレビュー描画: カット平面の法線で BB エッジを削除側（赤）と保持側（オレンジ）に分割
+    # カット平面プレビュー描画
     #
-    # 各エッジの中点の内積 normal.dot(mid - center) > 0 で削除側を判定。
-    # 削除側エッジ → 赤・太線（COLOR_DELETE_PREVIEW, line_width=3）
-    # 保持側エッジ → オレンジ・細線（COLOR_TARGET_VALID, line_width=2）
+    # ターゲット BB をグレー細線で描画し、カット境界位置を半透明赤ポリゴン＋アウトラインで可視化。
+    # 「箱の色分け」ではなく「どこで切れるか（刃の位置）」を直接表現する。
+    #
+    # カット平面ポリゴンのサイズ:
+    #   ターゲット BB 対角線 × 0.7 を半径として正方形ポリゴンを生成。
+    #   build_half_space_cutter と同じ perp 軸算出ロジックを使用。
     # ----------------------------------------------------------------
-    def draw_split_highlight(view, entity, cut_info)
+    def draw_cut_plane_preview(view, entity, cut_info)
       return unless entity&.valid?
 
-      corners = (0..7).map { |i| entity.bounds.corner(i) }
-      center  = cut_info[:center]
-      normal  = cut_info[:normal]
+      # ① ターゲット BB をグレー細線で描画（形状把握のみ）
+      draw_highlight(view, entity, COLOR_BB_PREVIEW, 1)
 
-      delete_pts = []
-      keep_pts   = []
+      # ② カット平面ポリゴンの頂点を算出
+      center    = cut_info[:center]
+      normal    = cut_info[:normal]
+      bb        = entity.bounds
+      half_size = bb.min.distance(bb.max) * 0.7
 
-      BB_EDGES.each do |a_idx, b_idx|
-        ca  = corners[a_idx]
-        cb  = corners[b_idx]
-        mid = Geom::Point3d.new(
-          (ca.x + cb.x) / 2.0,
-          (ca.y + cb.y) / 2.0,
-          (ca.z + cb.z) / 2.0
-        )
-        if normal.dot(mid - center) > 0
-          delete_pts << ca << cb
-        else
-          keep_pts << ca << cb
-        end
-      end
+      axes  = normal.axes
+      perp1 = axes[0]; perp1.length = half_size
+      perp2 = axes[1]; perp2.length = half_size
 
-      unless keep_pts.empty?
-        view.line_width    = 2
-        view.drawing_color = COLOR_TARGET_VALID
-        view.draw(GL_LINES, keep_pts)
-      end
+      pts = [
+        center.offset(perp1).offset(perp2),
+        center.offset(perp1.reverse).offset(perp2),
+        center.offset(perp1.reverse).offset(perp2.reverse),
+        center.offset(perp1).offset(perp2.reverse),
+      ]
 
-      unless delete_pts.empty?
-        view.line_width    = 3
-        view.drawing_color = COLOR_DELETE_PREVIEW
-        view.draw(GL_LINES, delete_pts)
-      end
+      # ③ 半透明赤ポリゴン（カット境界面）
+      view.drawing_color = COLOR_CUT_PLANE_FILL
+      view.draw(GL_POLYGON, pts)
+
+      # ④ 不透明赤アウトライン（ポリゴン縁取り）
+      view.line_width    = 2
+      view.drawing_color = COLOR_CUT_PLANE_EDGE
+      view.draw(GL_LINES, [pts[0], pts[1], pts[1], pts[2], pts[2], pts[3], pts[3], pts[0]])
     end
 
     def hovered_color
