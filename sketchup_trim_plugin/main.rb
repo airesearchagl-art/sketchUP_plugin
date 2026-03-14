@@ -279,15 +279,13 @@ module SketchupTrimPlugin
         #       不要な half_space 残骸は演算後に消去する。
         #       @cutter はこの演算に渡さないため保持される（連続トリム可能）。
         result = half_space.subtract(target)
-        half_space = nil  # subtract 成功時は既に削除済み
+        half_space = nil  # subtract 成功時は cutter（half_space）が API により自動削除済み
 
         raise 'ブーリアン演算が失敗しました（ソリッドが非マニフォールドの可能性があります）' if result.nil?
 
-        # subtract の result（half_space の残骸）は不要なので削除する
-        result.erase! if result&.valid?
-
+        # result = トリム済みの target（完成品）。erase! してはいけない。
         model.commit_operation
-        puts '[TrimTool] execute_trim: 完了'
+        puts "[TrimTool] execute_trim: 完了 result=#{entity_label(result)}"
 
         # STATE 1 を維持して同じカッターで連続トリムを可能にする
         @hovered            = nil
