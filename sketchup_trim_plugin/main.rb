@@ -97,8 +97,9 @@ module SketchupTrimPlugin
         if (candidate.is_a?(Sketchup::Group) || candidate.is_a?(Sketchup::ComponentInstance)) &&
            manifold?(candidate)
           puts "[TrimTool] activate: 選択済みソリッドをカッターとして自動登録 → #{entity_label(candidate)}"
-          @cutter = candidate
-          @state  = :trim_target_selection
+          @cutter                  = candidate
+          @cutter_global_transform = candidate.transformation  # 選択エンティティはトップレベルと想定
+          @state                   = :trim_target_selection
           sel.clear
         end
       end
@@ -123,7 +124,8 @@ module SketchupTrimPlugin
     def onMouseMove(_flags, x, y, view)
       ph = view.pick_helper
       ph.do_pick(x, y)
-      hovered = pick_solid(ph)
+      # グローバル変換付きでソリッドを取得（ネストされたコンポーネント対応）
+      hovered, = pick_solid_with_transform(ph)
 
       case @state
       when :cutter_selection
@@ -140,8 +142,11 @@ module SketchupTrimPlugin
           @hovered            = hovered
           @hovered_intersects = bounding_boxes_intersect?(@cutter, @hovered)
           # カット平面を事前計算（puts を抑制した quiet モードで呼び出し）
+          # @cutter_global_transform を使用してネストされたカッターも正確に変換
           @preview_cut_info = if @hovered_intersects && manifold?(@hovered)
-                                find_cut_face(@cutter, @hovered, @hover_pt, quiet: true)
+                                find_cut_face(@cutter, @hover_pt,
+                                              cutter_transform: @cutter_global_transform,
+                                              quiet: true)
                               end
           puts "[TrimTool] STATE 1 hover: #{entity_label(@hovered)} " \
                "intersects=#{@hovered_intersects} preview=#{!@preview_cut_info.nil?}"
@@ -161,11 +166,12 @@ module SketchupTrimPlugin
     def onLButtonDown(_flags, x, y, view)
       ph = view.pick_helper
       ph.do_pick(x, y)
-      entity = pick_solid(ph)
+      # グローバル変換付きでソリッドを取得（ネストされたコンポーネント対応）
+      entity, entity_transform = pick_solid_with_transform(ph)
 
       case @state
       when :cutter_selection
-        on_cutter_click(entity, view)
+        on_cutter_click(entity, entity_transform, view)
 
       when :trim_target_selection
         # STATE 1: クリック点をワールド座標で取得（ハーフスペースカッター法に使用）
@@ -228,7 +234,7 @@ module SketchupTrimPlugin
     # ----------------------------------------------------------------
     # STATE 0 クリック処理: カッターを選択して STATE 1 へ遷移
     # ----------------------------------------------------------------
-    def on_cutter_click(entity, _view)
+    def on_cutter_click(entity, entity_transform, _view)
       if entity.nil?
         puts '[TrimTool] STATE 0 click: ソリッドに当たりませんでした（スキップ）'
         return
@@ -241,9 +247,12 @@ module SketchupTrimPlugin
       end
 
       puts "[TrimTool] STATE 0 click: カッター選択 → #{entity_label(entity)}"
-      @cutter  = entity
-      @hovered = nil
-      @state   = :trim_target_selection
+      @cutter                  = entity
+      # ネスト対応: ピック時の累積変換をグローバル変換として保持
+      # nil の場合は entity.transformation にフォールバック（単体エンティティや API 非対応時）
+      @cutter_global_transform = entity_transform || entity.transformation
+      @hovered                 = nil
+      @state                   = :trim_target_selection
       puts '[TrimTool] → STATE 1 に遷移'
     end
 
@@ -290,7 +299,8 @@ module SketchupTrimPlugin
       model = Sketchup.active_model
 
       # ---- Step 1: カット平面の特定（内積による方向判定） -----
-      cut_info = find_cut_face(cutter, target, click_pt)
+      # @cutter_global_transform を使用してネストされた親グループの変換も考慮
+      cut_info = find_cut_face(cutter, click_pt, cutter_transform: @cutter_global_transform)
       if cut_info.nil?
         puts '[TrimTool] execute_trim: カット平面が見つかりませんでした'
         UI.messagebox(
@@ -332,6 +342,9 @@ module SketchupTrimPlugin
 
         raise 'ブーリアン演算が失敗しました（ソリッドが非マニフォールドの可能性があります）' if result.nil?
 
+        # subtract 成功後に共面エッジを除去（カット断面の不要な分割線をクリーンアップ）
+        cleanup_coplanar_edges(result)
+
         model.commit_operation
         puts "[TrimTool] execute_trim: 完了 result=#{entity_label(result)}"
 
@@ -361,13 +374,17 @@ module SketchupTrimPlugin
     #   （フェイス法線がクリック点方向を向く = 削除側の境界面）
     # 条件を満たす候補の中からクリック点に最も近いフェイスを返す。
     #
+    # cutter_transform: カッターのグローバル変換行列（nil の場合は cutter.transformation を使用）
+    #   ネストされた親グループがある場合に pick_solid_with_transform で取得した累積変換を渡す。
     # quiet: true にすると puts を抑制する（onMouseMove からの連続呼び出し用）
     #
     # @return [Hash] { center: Geom::Point3d, normal: Geom::Vector3d, dot: Float } or nil
     # ----------------------------------------------------------------
-    def find_cut_face(cutter, _target, click_pt, quiet: false)
+    def find_cut_face(cutter, click_pt, cutter_transform: nil, quiet: false)
       entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
-      transform = cutter.transformation
+      # グローバル変換が渡された場合はそれを優先（ネスト対応）
+      # nil の場合は entity.transformation にフォールバック
+      transform = cutter_transform || cutter.transformation
 
       best      = nil
       best_dist = Float::INFINITY
@@ -470,33 +487,42 @@ module SketchupTrimPlugin
     end
 
     # ----------------------------------------------------------------
-    # PickHelper からソリッドエンティティ（Group/ComponentInstance）を取得
+    # PickHelper からソリッドエンティティと「ワールド変換行列」を取得
+    #
+    # ネスト（入れ子）対応:
+    #   PickHelper の各パスを走査し、パスの末尾側（最内）にある
+    #   Group/ComponentInstance を採用する。
+    #   変換はルートから solid_path_idx までの transformation を手動で累積し
+    #   ワールド座標への正確な変換行列を生成する。
+    #   これにより親グループ内にあるコンポーネントでも正確なワールド座標が得られる。
+    #
+    # @return [Array(entity, Geom::Transformation)] エンティティとワールド変換
+    #         エンティティが見つからない場合は [nil, nil]
     # ----------------------------------------------------------------
-    def pick_solid(ph)
-      entity = ph.best_picked
-      return nil unless entity
-
-      unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
-        entity = find_enclosing_solid(ph)
-      end
-
-      return nil unless entity.is_a?(Sketchup::Group) || entity.is_a?(Sketchup::ComponentInstance)
-
-      entity
-    end
-
-    # ピックパスを逆順に辿り、最初に見つかった Group/ComponentInstance を返す
-    def find_enclosing_solid(ph)
+    def pick_solid_with_transform(ph)
       0.upto(ph.count - 1) do |i|
         path = ph.path_at(i)
-        next unless path
+        next unless path && !path.empty?
 
-        solid = path.reverse_each.find do |e|
-          e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+        # パス内で最も内側（末尾側）の Group/ComponentInstance のインデックスを特定
+        solid_path_idx = nil
+        path.each_with_index do |e, j|
+          solid_path_idx = j if e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
         end
-        return solid if solid
+        next unless solid_path_idx
+
+        # ルートから solid_path_idx まで全変換を累積してグローバル変換を算出
+        # （1段ネスト: parent.transform × child.transform、深くネストされた場合も同様）
+        world_tf = Geom::Transformation.new  # identity（単位行列）
+        0.upto(solid_path_idx) do |j|
+          e = path[j]
+          world_tf = world_tf * e.transformation if e.respond_to?(:transformation)
+        end
+
+        return [path[solid_path_idx], world_tf]
       end
-      nil
+
+      [nil, nil]
     end
 
     # ----------------------------------------------------------------
@@ -596,12 +622,49 @@ module SketchupTrimPlugin
     # 状態リセット（STATE 0 の初期状態に戻す）
     # ----------------------------------------------------------------
     def reset_state
-      @state              = :cutter_selection
-      @cutter             = nil
-      @hovered            = nil
-      @hovered_intersects = false
-      @hover_pt           = nil
-      @preview_cut_info   = nil
+      @state                   = :cutter_selection
+      @cutter                  = nil
+      @cutter_global_transform = nil
+      @hovered                 = nil
+      @hovered_intersects      = false
+      @hover_pt                = nil
+      @preview_cut_info        = nil
+    end
+
+    # ----------------------------------------------------------------
+    # 共面エッジのクリーンアップ
+    #
+    # ブーリアン演算（subtract）後、カット断面に生じる不要な分割エッジを除去する。
+    # 「同一平面上にある隣接フェイスの境界エッジ」＝「共面エッジ」を検出して削除。
+    #
+    # 共面エッジの判定条件（AND）:
+    #   1. フェイスを 2 つ持つエッジ（境界エッジのみ対象）
+    #   2. 両フェイスの法線が平行（外積の長さ < 1e-8）
+    #   3. f2 の代表頂点が f1 の平面方程式を満たす（距離 < 1e-6 inch）
+    #
+    # SketchUp の erase! は隣接フェイスをマージするため、
+    # 削除後のジオメトリは自動的に統合された大きなフェイスになる。
+    # ----------------------------------------------------------------
+    def cleanup_coplanar_edges(entity)
+      return unless entity&.valid?
+
+      ents = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+
+      to_delete = ents.grep(Sketchup::Edge).select do |edge|
+        next false unless edge.valid? && edge.faces.length == 2
+
+        f1, f2 = edge.faces
+        # 条件1: 法線が平行（外積 ≒ 0 → sin(θ) ≒ 0 → θ ≒ 0°）
+        next false if f1.normal.cross(f2.normal).length > 1e-8
+
+        # 条件2: 同一平面上（f2の頂点がf1の平面方程式を満たす）
+        plane = f1.plane
+        pt    = f2.vertices.first.position
+        (plane[0] * pt.x + plane[1] * pt.y + plane[2] * pt.z + plane[3]).abs < 1e-6
+      end
+
+      to_delete.each { |e| e.erase! if e.valid? }
+      puts "[TrimTool] cleanup_coplanar_edges: #{to_delete.length} 個の共面エッジを削除"
     end
 
     # ----------------------------------------------------------------
