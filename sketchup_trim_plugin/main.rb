@@ -378,10 +378,12 @@ module SketchupTrimPlugin
       # 底面サイズ: target の対角線の3倍（切断面が確実に target 全断面を覆う）
       half_size    = [target_diag * 3, 5.m].max
 
-      # plane_n に垂直な 2 軸ベクトルを計算（底面の正方形を定義するため）
-      perp1 = plane_n.perpendicular_vector  # 単位ベクトル
-      perp2 = plane_n.cross(perp1)          # 単位ベクトル（plane_n と perp1 に垂直）
-      perp1.length = half_size              # half_size の長さにスケール
+      # plane_n に垂直な 2 軸ベクトルを取得（底面の正方形を定義するため）
+      # axes は [x_axis, y_axis, z_axis] を返す。インデックス 0, 1 が plane_n に直交する単位ベクトル。
+      axes  = plane_n.axes
+      perp1 = axes[0]
+      perp2 = axes[1]
+      perp1.length = half_size
       perp2.length = half_size
 
       # カット平面上の大きな正方形の 4 頂点
