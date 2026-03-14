@@ -255,7 +255,9 @@ module SketchupTrimPlugin
            "center=#{cut_info[:center].to_s.gsub("\n", '')} " \
            "dot=#{cut_info[:dot].round(4)}"
 
-      # ---- Step 2〜4: カッターボックス生成 → subtract → Undo ラップ ----
+      # ---- Step 2〜4: Undo ラップ → カッターボックス生成 → subtract ----
+      # NOTE: start_operation を build_half_space_cutter より前に置くことで、
+      #       生成途中や演算失敗時に abort_operation だけで一時カッターが確実に消える。
       model.start_operation('Trim Solid', true)
       half_space = nil
 
@@ -270,17 +272,22 @@ module SketchupTrimPlugin
         )
         raise 'ハーフスペースカッターの生成に失敗しました' if half_space.nil?
 
-        puts '[TrimTool] execute_trim: target.subtract(half_space) 実行中...'
+        puts '[TrimTool] execute_trim: half_space.subtract(target) 実行中...'
 
-        # NOTE: subtract は target と half_space の両方を削除して result（新グループ）を返す。
-        #       @cutter はこの演算に渡さないため保持される。
-        result    = target.subtract(half_space)
+        # NOTE: subtract のレシーバ = カッター、引数 = 削られるターゲット。
+        #       half_space（巨大ボックス）からtarget（梁）をくり抜く形で演算し、
+        #       不要な half_space 残骸は演算後に消去する。
+        #       @cutter はこの演算に渡さないため保持される（連続トリム可能）。
+        result = half_space.subtract(target)
         half_space = nil  # subtract 成功時は既に削除済み
 
         raise 'ブーリアン演算が失敗しました（ソリッドが非マニフォールドの可能性があります）' if result.nil?
 
+        # subtract の result（half_space の残骸）は不要なので削除する
+        result.erase! if result&.valid?
+
         model.commit_operation
-        puts "[TrimTool] execute_trim: 完了 result=#{entity_label(result)}"
+        puts '[TrimTool] execute_trim: 完了'
 
         # STATE 1 を維持して同じカッターで連続トリムを可能にする
         @hovered            = nil
