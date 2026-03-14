@@ -30,9 +30,10 @@
 #     内積の絶対値 = カット平面からクリック点までの射影距離。
 #     この距離の2倍 + 余裕 を延伸長とすることで T字・貫通どちらにも対応。
 #
-# ■ ハイライト色
+# ■ ハイライト色（Phase 5 追加）
 #   シアン  : カット境界ソリッド（STATE 0 ホバー / STATE 1 固定表示）
-#   オレンジ: トリム可能なターゲット（カッターと交差あり）
+#   オレンジ: トリム可能なターゲット（保持される側のエッジ / カッターと交差あり）
+#   赤      : 削除プレビュー（ホバー時にカット平面の削除側エッジを強調）
 #   紫      : 交差が検出できないターゲット（操作不可）
 #   グレー  : 非マニフォールドのソリッド（操作不可）
 
@@ -48,6 +49,13 @@ module SketchupTrimPlugin
       Sketchup.active_model.select_tool(TrimTool.new)
     end
 
+    # 右クリックコンテキストメニューにも追加
+    UI.add_context_menu_handler do |menu|
+      menu.add_item('トリムツールを起動') do
+        Sketchup.active_model.select_tool(TrimTool.new)
+      end
+    end
+
     file_loaded(__FILE__)
   end
 
@@ -58,9 +66,10 @@ module SketchupTrimPlugin
     # ---- ハイライト色定数 ----------------------------------------
     COLOR_CUTTER_HOVER    = Sketchup::Color.new(  0, 210, 255, 180)  # シアン（STATE 0 ホバー）
     COLOR_CUTTER_SELECTED = Sketchup::Color.new(  0, 210, 255, 230)  # シアン（STATE 1 固定）
-    COLOR_TARGET_VALID    = Sketchup::Color.new(255, 140,   0, 180)  # オレンジ（交差あり）
+    COLOR_TARGET_VALID    = Sketchup::Color.new(255, 140,   0, 180)  # オレンジ（保持側 / 交差あり）
     COLOR_TARGET_INVALID  = Sketchup::Color.new(160,   0, 200, 180)  # 紫（交差なし）
     COLOR_NON_MANIFOLD    = Sketchup::Color.new(140, 140, 140, 120)  # グレー（非マニフォールド）
+    COLOR_DELETE_PREVIEW  = Sketchup::Color.new(220,  30,  30, 230)  # 赤（削除プレビュー）
 
     # BoundingBox の 12 辺（corners インデックスペア）
     BB_EDGES = [
@@ -91,6 +100,7 @@ module SketchupTrimPlugin
 
     # ----------------------------------------------------------------
     # onMouseMove: ホバー対象を更新してハイライトを再描画
+    # STATE 1 では hover_pt を取得し、削除プレビュー用の cut_info を事前計算する
     # ----------------------------------------------------------------
     def onMouseMove(_flags, x, y, view)
       ph = view.pick_helper
@@ -103,14 +113,24 @@ module SketchupTrimPlugin
         puts "[TrimTool] STATE 0 hover: #{entity_label(@hovered)}" if @hovered
 
       when :trim_target_selection
+        # ホバー座標をワールド座標で取得（削除プレビューに使用）
+        ip = Sketchup::InputPoint.new
+        ip.pick(view, x, y)
+        @hover_pt = ip.position
+
         if hovered && hovered != @cutter
           @hovered            = hovered
           @hovered_intersects = bounding_boxes_intersect?(@cutter, @hovered)
+          # カット平面を事前計算（puts を抑制した quiet モードで呼び出し）
+          @preview_cut_info = if @hovered_intersects && manifold?(@hovered)
+                                find_cut_face(@cutter, @hovered, @hover_pt, quiet: true)
+                              end
           puts "[TrimTool] STATE 1 hover: #{entity_label(@hovered)} " \
-               "intersects=#{@hovered_intersects}"
+               "intersects=#{@hovered_intersects} preview=#{!@preview_cut_info.nil?}"
         else
-          @hovered            = nil
+          @hovered          = nil
           @hovered_intersects = false
+          @preview_cut_info = nil
         end
       end
 
@@ -163,11 +183,23 @@ module SketchupTrimPlugin
 
     # ----------------------------------------------------------------
     # draw: バウンディングボックスのエッジでハイライト描画
-    #       ※ draw コールバック内でのみ有効
+    #
+    # STATE 1 でターゲット候補にホバー中かつ preview_cut_info がある場合は、
+    # draw_split_highlight によりカット平面の削除側（赤）と保持側（オレンジ）を
+    # 色分け描画してユーザーに削除プレビューを提示する。
+    # ※ draw コールバック内でのみ有効
     # ----------------------------------------------------------------
     def draw(view)
-      draw_highlight(view, @cutter,  COLOR_CUTTER_SELECTED, 3) if @cutter
-      draw_highlight(view, @hovered, hovered_color,          2) if @hovered
+      draw_highlight(view, @cutter, COLOR_CUTTER_SELECTED, 3) if @cutter
+
+      if @hovered
+        if @state == :trim_target_selection && @hovered_intersects && @preview_cut_info
+          # 削除プレビューモード: エッジをカット平面で赤（削除側）とオレンジ（保持側）に分割描画
+          draw_split_highlight(view, @hovered, @preview_cut_info)
+        else
+          draw_highlight(view, @hovered, hovered_color, 2)
+        end
+      end
     end
 
     # ==============================================================
@@ -234,7 +266,7 @@ module SketchupTrimPlugin
     #   @cutter（柱など境界ソリッド）は find_cut_face のカット平面特定にのみ使用。
     #   実際のブーリアン演算では一時生成した half_space_box で subtract を行う。
     #   → @cutter は演算に関与しないため絶対に保持される（連続トリムが可能）
-    #   → subtract 成功後、target と half_space_box は両方削除されて result が返る
+    #   → half_space.subtract(target) の戻り値はトリム済みの target（完成品）
     # ----------------------------------------------------------------
     def execute_trim(target, cutter, click_pt, view)
       model = Sketchup.active_model
@@ -274,22 +306,22 @@ module SketchupTrimPlugin
 
         puts '[TrimTool] execute_trim: half_space.subtract(target) 実行中...'
 
-        # NOTE: subtract のレシーバ = カッター、引数 = 削られるターゲット。
-        #       half_space（巨大ボックス）からtarget（梁）をくり抜く形で演算し、
-        #       不要な half_space 残骸は演算後に消去する。
+        # NOTE: subtract のレシーバ = カッター（half_space）、引数 = 削られるターゲット。
+        #       戻り値はトリム済みの target（完成品）。cutter（half_space）は API が自動削除。
         #       @cutter はこの演算に渡さないため保持される（連続トリム可能）。
-        result = half_space.subtract(target)
+        result     = half_space.subtract(target)
         half_space = nil  # subtract 成功時は cutter（half_space）が API により自動削除済み
 
         raise 'ブーリアン演算が失敗しました（ソリッドが非マニフォールドの可能性があります）' if result.nil?
 
-        # result = トリム済みの target（完成品）。erase! してはいけない。
         model.commit_operation
         puts "[TrimTool] execute_trim: 完了 result=#{entity_label(result)}"
 
         # STATE 1 を維持して同じカッターで連続トリムを可能にする
-        @hovered            = nil
+        @hovered          = nil
         @hovered_intersects = false
+        @preview_cut_info = nil
+        @hover_pt         = nil
         Sketchup.status_text = 'トリム完了。引き続き同じカッターで別の端部をトリムできます。ESC でカッター再選択。'
 
       rescue RuntimeError => e
@@ -307,14 +339,15 @@ module SketchupTrimPlugin
     # カット平面の特定
     #
     # カッターソリッドのフェイス群を走査し、以下の条件を満たすフェイスを選択:
-    #   条件1: フェイス中心が target の BoundingBox 内（交差領域チェック）
-    #   条件2: plane_n.dot(click_pt - plane_pt) > 0
-    #          （フェイス法線がクリック点方向を向く = 削除側の境界面）
+    #   plane_n.dot(click_pt - plane_pt) > 0
+    #   （フェイス法線がクリック点方向を向く = 削除側の境界面）
     # 条件を満たす候補の中からクリック点に最も近いフェイスを返す。
+    #
+    # quiet: true にすると puts を抑制する（onMouseMove からの連続呼び出し用）
     #
     # @return [Hash] { center: Geom::Point3d, normal: Geom::Vector3d, dot: Float } or nil
     # ----------------------------------------------------------------
-    def find_cut_face(cutter, target, click_pt)
+    def find_cut_face(cutter, _target, click_pt, quiet: false)
       entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
       transform = cutter.transformation
 
@@ -340,9 +373,11 @@ module SketchupTrimPlugin
         end
       end
 
-      face_count = entities.grep(Sketchup::Face).count
-      puts "[TrimTool] find_cut_face: #{best ? '検出成功' : '候補なし'} " \
-           "(フェイス数=#{face_count})"
+      unless quiet
+        face_count = entities.grep(Sketchup::Face).count
+        puts "[TrimTool] find_cut_face: #{best ? '検出成功' : '候補なし'} " \
+             "(フェイス数=#{face_count})"
+      end
       best
     end
 
@@ -373,10 +408,10 @@ module SketchupTrimPlugin
       end
 
       # 延伸距離: クリック点までの射影距離の2倍 + target全体をカバーする保険距離
-      target_diag  = bb.min.distance(bb.max)
-      extend_dist  = [dot * 2 + 5.m, target_diag * 3 + 10.m].max
+      target_diag = bb.min.distance(bb.max)
+      extend_dist = [dot * 2 + 5.m, target_diag * 3 + 10.m].max
       # 底面サイズ: target の対角線の3倍（切断面が確実に target 全断面を覆う）
-      half_size    = [target_diag * 3, 5.m].max
+      half_size   = [target_diag * 3, 5.m].max
 
       # plane_n に垂直な 2 軸ベクトルを取得（底面の正方形を定義するため）
       # axes は [x_axis, y_axis, z_axis] を返す。インデックス 0, 1 が plane_n に直交する単位ベクトル。
@@ -469,7 +504,7 @@ module SketchupTrimPlugin
     end
 
     # ----------------------------------------------------------------
-    # BoundingBox のエッジをワイヤーフレームで描画（draw 内専用）
+    # BoundingBox のエッジをワイヤーフレームで単色描画（draw 内専用）
     # ----------------------------------------------------------------
     def draw_highlight(view, entity, color, line_width)
       return unless entity&.valid?
@@ -481,6 +516,51 @@ module SketchupTrimPlugin
       view.line_width    = line_width
       view.drawing_color = color
       view.draw(GL_LINES, pts)
+    end
+
+    # ----------------------------------------------------------------
+    # 削除プレビュー描画: カット平面の法線で BB エッジを削除側（赤）と保持側（オレンジ）に分割
+    #
+    # 各エッジの中点の内積 normal.dot(mid - center) > 0 で削除側を判定。
+    # 削除側エッジ → 赤・太線（COLOR_DELETE_PREVIEW, line_width=3）
+    # 保持側エッジ → オレンジ・細線（COLOR_TARGET_VALID, line_width=2）
+    # ----------------------------------------------------------------
+    def draw_split_highlight(view, entity, cut_info)
+      return unless entity&.valid?
+
+      corners = (0..7).map { |i| entity.bounds.corner(i) }
+      center  = cut_info[:center]
+      normal  = cut_info[:normal]
+
+      delete_pts = []
+      keep_pts   = []
+
+      BB_EDGES.each do |a_idx, b_idx|
+        ca  = corners[a_idx]
+        cb  = corners[b_idx]
+        mid = Geom::Point3d.new(
+          (ca.x + cb.x) / 2.0,
+          (ca.y + cb.y) / 2.0,
+          (ca.z + cb.z) / 2.0
+        )
+        if normal.dot(mid - center) > 0
+          delete_pts << ca << cb
+        else
+          keep_pts << ca << cb
+        end
+      end
+
+      unless keep_pts.empty?
+        view.line_width    = 2
+        view.drawing_color = COLOR_TARGET_VALID
+        view.draw(GL_LINES, keep_pts)
+      end
+
+      unless delete_pts.empty?
+        view.line_width    = 3
+        view.drawing_color = COLOR_DELETE_PREVIEW
+        view.draw(GL_LINES, delete_pts)
+      end
     end
 
     def hovered_color
@@ -504,6 +584,8 @@ module SketchupTrimPlugin
       @cutter             = nil
       @hovered            = nil
       @hovered_intersects = false
+      @hover_pt           = nil
+      @preview_cut_info   = nil
     end
 
     # ----------------------------------------------------------------
