@@ -231,116 +231,114 @@ module SuSmartFramingTools
     end
 
     # ----------------------------------------------------------------
-    # 絶対方向指定ロジックによるコーナー処理（execute_corner）
+    # 原子操作フローによるコーナー処理（execute_corner）
     #
-    # ① キャッシュ: クリック時点の face_center / face_normal をワールド座標で保存
-    # ② PushPull: t値で相手境界面まで確実に交差する距離を計算して延伸
-    #    - 面が平行/垂直（denom ≈ 0）の場合は対角線ベースのフォールバック
-    # ③ waste_pt を絶対固定: plane_pt.offset(plane_n, 1000mm) により
-    #    build_half_space_cutter の内積チェックが常に正値になることを保証
-    # ④ cutter_a（A の面基準）→ member_b をトリム
-    #    cutter_b（B の面基準）→ member_a をトリム
-    # ⑤ cleanup × 2 → commit
+    # 設計原則:
+    #   - 幾何データ（center/normal）は処理冒頭で純粋な数値として退避。
+    #     以降の Entity 削除・再編成の影響を受けない。
+    #   - make_unique → face 再取得 → pushpull を 1 部材ずつ原子的に実行。
+    #   - cutter の生成と subtract を逐次実行し、
+    #     「subtract 結果で変数を上書き」することで古い参照を確実に破棄。
+    #   - 2 本目の cutter は 1 本目の subtract 完了後に生成することで
+    #     SketchUp 内部の Entity 再編成による参照破壊を回避する。
+    #   - waste_pt は元の法線方向に固定し、build_half_space_cutter の
+    #     内積チェックを常に正値に保証する。
     # ----------------------------------------------------------------
     def execute_corner(member_a, member_a_tf, click_pt_a, cut_info_a,
                        member_b, member_b_tf, click_pt_b, cut_info_b,
                        view)
       model = Sketchup.active_model
 
-      # ---- ① キャッシュ（make_unique 後も数値は不変）--------------------
-      a_pt = cut_info_a[:center].clone
-      a_n  = cut_info_a[:normal].clone
+      # ──────────────────────────────────────────────────────────────
+      # ① 幾何データの完全退避（Entity 参照に依存しない純粋な数値）
+      # ──────────────────────────────────────────────────────────────
+      a_pt = cut_info_a[:center].clone   # 部材A クリック面の中心（ワールド座標）
+      a_n  = cut_info_a[:normal].clone   # 部材A クリック面の法線（外向き、正規化済み）
       b_pt = cut_info_b[:center].clone
       b_n  = cut_info_b[:normal].clone
 
-      # ---- PushPull 距離計算 -----------------------------------------
+      # waste_pt: 元の法線方向に 1000mm 固定オフセット
+      # → build_half_space_cutter 内 dot = n.dot(waste_pt - pt) = n.dot(n*1000) = 1000 > 0 を保証
+      waste_pt_a = a_pt.offset(a_n, 1000.mm)   # cutter_a（B を削る刃）の方向基準点
+      waste_pt_b = b_pt.offset(b_n, 1000.mm)   # cutter_b（A を削る刃）の方向基準点
+
+      # PushPull 距離: |t値| + 1000mm（確実に相手平面を突き抜ける量）
       diag_a        = member_a.bounds.min.distance(member_a.bounds.max)
       diag_b        = member_b.bounds.min.distance(member_b.bounds.max)
       fallback_dist = [diag_a, diag_b].max * 2 + 1000.mm
 
-      # A の面法線方向に進んで B の平面に到達する距離 t を求め、|t|+余裕 を採用
-      denom_ab = b_n.dot(a_n)
-      push_a = if denom_ab.abs >= 1e-6
-                 t_a = -b_n.dot(a_pt - b_pt) / denom_ab
-                 t_a.abs + 1000.mm
-               else
-                 fallback_dist
-               end
-
-      # B の面法線方向に進んで A の平面に到達する距離 t を求め、|t|+余裕 を採用
-      denom_ba = a_n.dot(b_n)
-      push_b = if denom_ba.abs >= 1e-6
-                 t_b = -a_n.dot(b_pt - a_pt) / denom_ba
-                 t_b.abs + 1000.mm
-               else
-                 fallback_dist
-               end
-
-      # ---- ③ waste_pt を絶対固定 ------------------------------------
-      # plane_pt.offset(plane_n, 1000mm) により、
-      # build_half_space_cutter 内の dot = plane_n.dot(waste_pt - plane_pt)
-      # = plane_n.dot(plane_n * 1000mm) = 1000mm > 0 が確実に保証される。
-      # PushPull 後に面が移動しても、元の法線方向を固定するためブレない。
-      waste_pt_a = a_pt.offset(a_n, 1000.mm)  # cutter_a（B を削る刃）の方向指定
-      waste_pt_b = b_pt.offset(b_n, 1000.mm)  # cutter_b（A を削る刃）の方向指定
+      denom = b_n.dot(a_n)
+      if denom.abs >= 1e-6
+        push_a = (-b_n.dot(a_pt - b_pt) / denom).abs + 1000.mm
+        push_b = (-a_n.dot(b_pt - a_pt) / denom).abs + 1000.mm
+      else
+        push_a = fallback_dist
+        push_b = fallback_dist
+      end
 
       model.start_operation('Corner Solid', true)
-      cutter_a = nil
-      cutter_b = nil
+      cutter = nil   # 生成中のカッター参照（rescue で erase! するためのホルダー）
 
       begin
-        # ---- make_unique: ComponentInstance を固有化 --------------------
+        # ──────────────────────────────────────────────────────────
+        # ② Atomic Step 1: 部材A — make_unique → face 再取得 → PushPull
+        # ──────────────────────────────────────────────────────────
         member_a.make_unique if member_a.is_a?(Sketchup::ComponentInstance)
-        member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
-
-        # ---- make_unique 後にカット面オブジェクトを再取得 ----------------
         face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
         raise '部材Aのカット面を取得できませんでした（make_unique 後）' if face_a.nil?
+        face_a.pushpull(push_a)
+        # face_a は pushpull 後に無効化されるが以降は使用しない
+        puts "[CornerTool] PushPull A 完了: #{push_a.to_f.round(1)}in"
 
+        # ──────────────────────────────────────────────────────────
+        # Atomic Step 2: 部材B — make_unique → face 再取得 → PushPull
+        # ──────────────────────────────────────────────────────────
+        member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
         face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
         raise '部材Bのカット面を取得できませんでした（make_unique 後）' if face_b.nil?
-
-        # ---- ② PushPull: 相手境界面まで確実に交差する距離で延伸 ----------
-        puts "[CornerTool] execute_corner: PushPull " \
-             "A=#{push_a.to_f.round(1)}in B=#{push_b.to_f.round(1)}in"
-        face_a.pushpull(push_a)
         face_b.pushpull(push_b)
+        puts "[CornerTool] PushPull B 完了: #{push_b.to_f.round(1)}in"
 
-        # ---- ④ カッター生成 -------------------------------------------
-        # cutter_a: A の面（a_pt, a_n）を境界として member_b の余分をトリム
-        cutter_a = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_a)
-        raise 'カッターA（部材B 用）の生成に失敗しました' if cutter_a.nil?
+        # ──────────────────────────────────────────────────────────
+        # Atomic Step 3: cutter_a 生成 → member_b をトリム → 参照を更新
+        # （cutter 生成 & subtract を一組で実行し古い参照を即座に破棄）
+        # ──────────────────────────────────────────────────────────
+        cutter = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_a)
+        raise 'カッターA（部材B 用）の生成に失敗しました' if cutter.nil?
 
-        # cutter_b: B の面（b_pt, b_n）を境界として member_a の余分をトリム
-        cutter_b = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_b)
-        raise 'カッターB（部材A 用）の生成に失敗しました' if cutter_b.nil?
+        puts '[CornerTool] cutter_a.subtract(member_b) 実行中...'
+        member_b = cutter.subtract(member_b)   # 戻り値で更新（古い member_b は削除済み）
+        cutter   = nil
+        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if member_b.nil?
 
-        # ---- ④ 相互 subtract ------------------------------------------
-        puts '[CornerTool] execute_corner: cutter_a.subtract(member_b) 実行中...'
-        res_b    = cutter_a.subtract(member_b)
-        cutter_a = nil
-        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
+        # ──────────────────────────────────────────────────────────
+        # Atomic Step 4: cutter_b 生成 → member_a をトリム → 参照を更新
+        # Step 3 の subtract 完了後に生成することで
+        # SketchUp 内部の Entity 再編成による参照破壊を防ぐ
+        # ──────────────────────────────────────────────────────────
+        cutter = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_b)
+        raise 'カッターB（部材A 用）の生成に失敗しました' if cutter.nil?
 
-        puts '[CornerTool] execute_corner: cutter_b.subtract(member_a) 実行中...'
-        res_a    = cutter_b.subtract(member_a)
-        cutter_b = nil
-        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
+        puts '[CornerTool] cutter_b.subtract(member_a) 実行中...'
+        member_a = cutter.subtract(member_a)   # 戻り値で更新（古い member_a は削除済み）
+        cutter   = nil
+        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if member_a.nil?
 
-        # ---- ⑤ 共面エッジのクリーンアップ & コミット --------------------
-        cleanup_coplanar_edges(res_a)
-        cleanup_coplanar_edges(res_b)
+        # ──────────────────────────────────────────────────────────
+        # ③ 共面エッジのクリーンアップ & コミット
+        # ──────────────────────────────────────────────────────────
+        cleanup_coplanar_edges(member_a)
+        cleanup_coplanar_edges(member_b)
 
         model.commit_operation
-        puts "[CornerTool] execute_corner: 完了 " \
-             "res_a=#{entity_label(res_a)} res_b=#{entity_label(res_b)}"
+        puts "[CornerTool] 完了: #{entity_label(member_a)} / #{entity_label(member_b)}"
         Sketchup.status_text = 'コーナー処理完了。ESC で次の部材Aを選択できます。'
         reset_state
 
-      rescue RuntimeError => e
+      rescue StandardError => e
         model.abort_operation
-        cutter_a&.erase! if cutter_a&.valid?
-        cutter_b&.erase! if cutter_b&.valid?
-        puts "[CornerTool] execute_corner エラー: #{e.message}"
+        cutter&.erase! if cutter&.valid?
+        puts "[CornerTool] execute_corner エラー: #{e.class}: #{e.message}"
         UI.messagebox("コーナー処理失敗：\n#{e.message}", MB_OK)
       end
 
