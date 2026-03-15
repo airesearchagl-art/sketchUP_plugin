@@ -2,26 +2,24 @@
 
 # su_smart_framing_tools/tools/corner_tool.rb
 #
-# CornerTool – 交差する2部材を相互トリムしてL字コーナーを生成するツール
+# CornerTool – 交差・未交差を問わずL字コーナーを生成するツール
 #
 # ■ 状態遷移（ステートマシン）
-#   STATE 0: :select_member_a → 1つ目の部材（削られる境界面をクリック）
-#   STATE 1: :select_member_b → 2つ目の部材（削られる境界面をクリック）
+#   STATE 0: :select_member_a → 1つ目の部材（削除したい側をクリック）
+#   STATE 1: :select_member_b → 2つ目の部材（削除したい側をクリック）
 #
-# ■ 相互トリムアルゴリズム（execute_corner）
-#   ① 部材Aのクリック位置から find_cut_face でカット平面 cut_info_a を取得
-#   ② 部材Bのクリック位置から find_cut_face でカット平面 cut_info_b を取得
-#   ③ build_half_space_cutter(cut_info_a) → cutter_a（部材Bを削るカッター）
-#   ④ build_half_space_cutter(cut_info_b) → cutter_b（部材Aを削るカッター）
-#   ⑤ res_b = cutter_a.subtract(member_b)   ← AのカッターでBを削る
-#   ⑥ res_a = cutter_b.subtract(member_a)   ← BのカッターでAを削る
-#   ⑦ cleanup_coplanar_edges(res_a), cleanup_coplanar_edges(res_b)
-#   ⑧ commit_operation（失敗時は abort_operation で全ロールバック）
+# ■ 「強制交差＆相互トリム」アルゴリズム（execute_corner）
 #
-# ■ ユーザー操作イメージ
-#   クリック位置は「削除したい側」（はみ出し部分の内側）を示す。
-#   find_cut_face がクリック点に向いている面（境界面）を自動検出し、
-#   その面を起点にハーフスペースカッターを生成する。
+#   交差済み・未交差どちらにも対応するため PushPull フェーズを先行させる:
+#
+#   ① make_unique: ComponentInstance の場合は固有化して他インスタンスへの影響を防ぐ
+#   ② キャッシュ: クリック時点でのカット面のワールド座標（中心・法線）を保存
+#   ③ PushPull: 両部材のクリックされた面を 10000mm 押し出して強制的に交差させる
+#      （元から交差している場合もさらに延ばすだけなので問題なし）
+#   ④ build_half_space_cutter: キャッシュ済みの「元の面位置」を使ってカッターを生成
+#      （PushPull 後の現在位置ではなく、クリック時点の面位置で切断する）
+#   ⑤ cutter_a.subtract(member_b) / cutter_b.subtract(member_a) で相互トリム
+#   ⑥ cleanup_coplanar_edges → commit_operation（失敗時は abort_operation）
 #
 # ■ 幾何学処理は GeometryHelper に委譲（include SuSmartFramingTools::GeometryHelper）
 
@@ -173,24 +171,21 @@ module SuSmartFramingTools
     private
 
     # ----------------------------------------------------------------
-    # STATE 0 クリック処理: 部材Aとカット平面を登録して STATE 1 へ遷移
+    # STATE 0 クリック処理: 部材Aとカット平面をキャッシュして STATE 1 へ遷移
     # ----------------------------------------------------------------
     def on_member_a_click(entity, entity_tf, click_pt, _view)
       if entity.nil?
         puts '[CornerTool] STATE 0 click: ソリッドが見つかりませんでした（スキップ）'
         return
       end
-
       unless manifold?(entity)
-        puts "[CornerTool] STATE 0 click: 非マニフォールド → 選択不可 #{entity_label(entity)}"
         Sketchup.status_text = '警告：選択した部材はソリッドではありません。別の部材を選択してください。'
         return
       end
 
       cut_info = find_cut_face(entity, click_pt, cutter_transform: entity_tf)
       if cut_info.nil?
-        puts '[CornerTool] STATE 0 click: カット平面を検出できませんでした'
-        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側の面付近をクリックしてください。'
+        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側をクリックしてください。'
         return
       end
 
@@ -198,11 +193,11 @@ module SuSmartFramingTools
       @member_a    = entity
       @member_a_tf = entity_tf
       @click_pt_a  = click_pt
-      @cut_info_a  = cut_info
+      @cut_info_a  = cut_info   # ワールド座標でキャッシュ（execute_corner で使用）
       @hovered     = nil
       @hovered_tf  = nil
       @preview_cut_info = nil
-      @state       = :select_member_b
+      @state = :select_member_b
       puts '[CornerTool] → STATE 1 に遷移'
     end
 
@@ -214,49 +209,41 @@ module SuSmartFramingTools
         puts '[CornerTool] STATE 1 click: ソリッドが見つかりませんでした（スキップ）'
         return
       end
-
       if entity == @member_a
-        puts '[CornerTool] STATE 1 click: 部材Aと同一エンティティ（スキップ）'
         Sketchup.status_text = '警告：部材Aと同じ部材です。別の部材を選択してください。'
         return
       end
-
       unless manifold?(entity)
-        puts "[CornerTool] STATE 1 click: 非マニフォールド → 選択不可 #{entity_label(entity)}"
         Sketchup.status_text = '警告：選択した部材はソリッドではありません。別の部材を選択してください。'
         return
       end
 
       cut_info_b = find_cut_face(entity, click_pt, cutter_transform: entity_tf)
       if cut_info_b.nil?
-        puts '[CornerTool] STATE 1 click: カット平面を検出できませんでした'
-        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側の面付近をクリックしてください。'
+        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側をクリックしてください。'
         return
       end
 
-      puts "[CornerTool] STATE 1 click: 部材B を確定 → #{entity_label(entity)} → コーナー処理開始"
-      execute_corner(@member_a, @cut_info_a, @click_pt_a,
-                     entity, cut_info_b, click_pt,
+      puts "[CornerTool] STATE 1 click: 部材B を確定 → #{entity_label(entity)}"
+      execute_corner(@member_a, @member_a_tf, @click_pt_a, @cut_info_a,
+                     entity, entity_tf, click_pt, cut_info_b,
                      view)
     end
 
     # ----------------------------------------------------------------
-    # 相互トリムによるコーナー処理（execute_corner）
+    # 強制交差＆相互トリムによるコーナー処理（execute_corner）
     #
-    # ★ カッター生成の方向性:
-    #   - cutter_a は cut_info_a（部材Aの境界面）から click_pt_a 方向へ延伸
-    #     → 部材Bの「click_pt_a 側」をカットする
-    #   - cutter_b は cut_info_b（部材Bの境界面）から click_pt_b 方向へ延伸
-    #     → 部材Aの「click_pt_b 側」をカットする
-    #
-    # ★ 法線ベクトルは clone して渡す:
-    #   build_half_space_cutter が plane_n.reverse! で in-place 変更する可能性があるため。
-    #
-    # ★ Undo 設計:
-    #   abort_operation により cutter_a/cutter_b の生成・subtract 結果をすべてロールバック。
+    # ① make_unique（ComponentInstance を固有化）
+    # ② カット面オブジェクトを再取得（make_unique 後に定義が変わるため）
+    # ③ PushPull: クリックされた面を PUSH_DIST 押し出して強制交差
+    # ④ build_half_space_cutter: キャッシュ済みの「元の面位置」からカッターを生成
+    #    → PushPull で延びた余分な部分も含めて元の境界面より先を全て除去
+    # ⑤ subtract × 2 → cleanup × 2 → commit
     # ----------------------------------------------------------------
-    def execute_corner(member_a, cut_info_a, click_pt_a,
-                       member_b, cut_info_b, click_pt_b,
+    PUSH_DIST = 10_000.mm  # 未交差ケースを確実にカバーする押し出し距離
+
+    def execute_corner(member_a, member_a_tf, click_pt_a, cut_info_a,
+                       member_b, member_b_tf, click_pt_b, cut_info_b,
                        view)
       model = Sketchup.active_model
       model.start_operation('Corner Solid', true)
@@ -264,31 +251,52 @@ module SuSmartFramingTools
       cutter_b = nil
 
       begin
-        # ---- cutter_a: cut_info_a の面から click_pt_a 方向へ → member_b を削る ----
+        # ---- ① ComponentInstance を固有化 --------------------------------
+        member_a.make_unique if member_a.is_a?(Sketchup::ComponentInstance)
+        member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
+
+        # ---- ② make_unique 後にカット面オブジェクトを再取得 ----------------
+        # make_unique により定義が差し替わるため、保存済みの Face 参照は無効になる可能性がある。
+        # cut_info（ワールド座標の中心・法線）は数値なので引き続き有効。
+        face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
+        raise '部材Aのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_a.nil?
+
+        face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
+        raise '部材Bのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_b.nil?
+
+        # ---- ③ PushPull: 両部材を強制的に延伸して交差させる ----------------
+        # face.pushpull(dist) は面のローカル法線方向に dist だけ押し出す。
+        # find_cut_face_object はワールド法線が click_pt 方向を向く面（外向き面）を返すため、
+        # 正の dist で部材が click_pt 方向（削除したい側）へ延伸される。
+        puts "[CornerTool] execute_corner: PushPull 実行 dist=#{PUSH_DIST.to_f.round(1)}mm"
+        face_a.pushpull(PUSH_DIST)
+        face_b.pushpull(PUSH_DIST)
+
+        # ---- ④ ハーフスペースカッターを生成 --------------------------------
+        # cut_info_a / cut_info_b は PushPull 前の「元の面位置」のため、
+        # 延ばした余分な部分を含めて元の境界面より先を全て除去できる。
         n_a      = cut_info_a[:normal].clone
         cutter_a = build_half_space_cutter(model, cut_info_a[:center], n_a,
                                            member_b, click_pt_a)
         raise 'カッターA（部材B 用）の生成に失敗しました' if cutter_a.nil?
 
-        # ---- cutter_b: cut_info_b の面から click_pt_b 方向へ → member_a を削る ----
         n_b      = cut_info_b[:normal].clone
         cutter_b = build_half_space_cutter(model, cut_info_b[:center], n_b,
                                            member_a, click_pt_b)
         raise 'カッターB（部材A 用）の生成に失敗しました' if cutter_b.nil?
 
-        # ---- AのカッターでBを削る ----------------------------------------
+        # ---- ⑤ 相互 subtract -------------------------------------------
         puts '[CornerTool] execute_corner: cutter_a.subtract(member_b) 実行中...'
         res_b    = cutter_a.subtract(member_b)
-        cutter_a = nil  # subtract 成功時は API が cutter を自動削除済み
+        cutter_a = nil
         raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
 
-        # ---- BのカッターでAを削る ----------------------------------------
         puts '[CornerTool] execute_corner: cutter_b.subtract(member_a) 実行中...'
         res_a    = cutter_b.subtract(member_a)
-        cutter_b = nil  # subtract 成功時は API が cutter を自動削除済み
+        cutter_b = nil
         raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
 
-        # ---- 断面の共面エッジをクリーンアップ ------------------------------
+        # ---- ⑥ 共面エッジのクリーンアップ ---------------------------------
         cleanup_coplanar_edges(res_a)
         cleanup_coplanar_edges(res_b)
 
@@ -296,8 +304,6 @@ module SuSmartFramingTools
         puts "[CornerTool] execute_corner: 完了 " \
              "res_a=#{entity_label(res_a)} res_b=#{entity_label(res_b)}"
         Sketchup.status_text = 'コーナー処理完了。ESC で次の部材Aを選択できます。'
-
-        # 処理完了後は STATE 0 にリセット（次のコーナー操作に備える）
         reset_state
 
       rescue RuntimeError => e
@@ -312,12 +318,45 @@ module SuSmartFramingTools
     end
 
     # ----------------------------------------------------------------
+    # カット面の Face オブジェクトを返す（GeometryHelper#find_cut_face の Face 返し版）
+    #
+    # find_cut_face と同じロジックで「click_pt 方向を向く最近接面」を探し、
+    # そのワールド座標情報ではなく Sketchup::Face オブジェクト自体を返す。
+    # make_unique 後に呼ぶことで有効な Face 参照を取得できる。
+    #
+    # @return [Sketchup::Face, nil]
+    # ----------------------------------------------------------------
+    def find_cut_face_object(entity, click_pt, entity_transform: nil)
+      ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      transform = entity_transform || entity.transformation
+
+      best_face = nil
+      best_dist = Float::INFINITY
+
+      ents.grep(Sketchup::Face).each do |face|
+        center_world = face.bounds.center.transform(transform)
+        normal_world = face.normal.transform(transform)
+        normal_world.normalize!
+
+        dot = normal_world.dot(click_pt - center_world)
+        next if dot <= 0.0
+
+        dist = center_world.distance(click_pt)
+        if dist < best_dist
+          best_dist = dist
+          best_face = face
+        end
+      end
+
+      best_face
+    end
+
+    # ----------------------------------------------------------------
     # カット平面プレビュー描画（BB グレー細線 + カット面ポリゴン）
     # ----------------------------------------------------------------
     def draw_cut_plane_preview(view, entity, cut_info, fill_color, edge_color)
       return unless entity&.valid?
 
-      # ターゲット BB をグレー細線で描画（形状把握）
       draw_highlight(view, entity, COLOR_BB_WIRE, 1)
 
       center    = cut_info[:center]
@@ -335,11 +374,9 @@ module SuSmartFramingTools
         center.offset(perp1).offset(perp2.reverse),
       ]
 
-      # 半透明ポリゴン
       view.drawing_color = fill_color
       view.draw(GL_POLYGON, pts)
 
-      # 輪郭線
       view.line_width    = 2
       view.drawing_color = edge_color
       view.draw(GL_LINES, [pts[0], pts[1], pts[1], pts[2],
