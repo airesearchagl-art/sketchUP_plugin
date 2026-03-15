@@ -231,85 +231,102 @@ module SuSmartFramingTools
     end
 
     # ----------------------------------------------------------------
-    # t値ベースの強制延伸＆相互トリムによるコーナー処理（execute_corner）
+    # 絶対方向指定ロジックによるコーナー処理（execute_corner）
     #
-    # ① make_unique（ComponentInstance を固有化）
-    # ② カット面オブジェクトを再取得（make_unique 後に定義が変わるため）
-    # ③ PushPull: t値で「相手境界面まで到達する距離 + 余裕」を算出して延伸
-    #    - denom = b_n.dot(a_n) が 0 に近い（面が平行/垂直）場合は対角線ベースのフォールバック
-    # ④ build_half_space_cutter で相手境界面からカッターを生成
-    # ⑤ subtract × 2 → cleanup × 2 → commit
+    # ① キャッシュ: クリック時点の face_center / face_normal をワールド座標で保存
+    # ② PushPull: t値で相手境界面まで確実に交差する距離を計算して延伸
+    #    - 面が平行/垂直（denom ≈ 0）の場合は対角線ベースのフォールバック
+    # ③ waste_pt を絶対固定: plane_pt.offset(plane_n, 1000mm) により
+    #    build_half_space_cutter の内積チェックが常に正値になることを保証
+    # ④ cutter_a（A の面基準）→ member_b をトリム
+    #    cutter_b（B の面基準）→ member_a をトリム
+    # ⑤ cleanup × 2 → commit
     # ----------------------------------------------------------------
     def execute_corner(member_a, member_a_tf, click_pt_a, cut_info_a,
                        member_b, member_b_tf, click_pt_b, cut_info_b,
                        view)
       model = Sketchup.active_model
 
-      a_pt = cut_info_a[:center]
+      # ---- ① キャッシュ（make_unique 後も数値は不変）--------------------
+      a_pt = cut_info_a[:center].clone
       a_n  = cut_info_a[:normal].clone
-      b_pt = cut_info_b[:center]
+      b_pt = cut_info_b[:center].clone
       b_n  = cut_info_b[:normal].clone
 
+      # ---- PushPull 距離計算 -----------------------------------------
       diag_a        = member_a.bounds.min.distance(member_a.bounds.max)
       diag_b        = member_b.bounds.min.distance(member_b.bounds.max)
       fallback_dist = [diag_a, diag_b].max * 2 + 1000.mm
 
-      denom = b_n.dot(a_n)
-      if denom.abs >= 1e-6
-        t_a = -b_n.dot(a_pt - b_pt) / denom
-        t_b = -a_n.dot(b_pt - a_pt) / denom
-        overshoot_a = t_a.abs + 1000.mm
-        overshoot_b = t_b.abs + 1000.mm
-      else
-        overshoot_a = fallback_dist
-        overshoot_b = fallback_dist
-      end
+      # A の面法線方向に進んで B の平面に到達する距離 t を求め、|t|+余裕 を採用
+      denom_ab = b_n.dot(a_n)
+      push_a = if denom_ab.abs >= 1e-6
+                 t_a = -b_n.dot(a_pt - b_pt) / denom_ab
+                 t_a.abs + 1000.mm
+               else
+                 fallback_dist
+               end
+
+      # B の面法線方向に進んで A の平面に到達する距離 t を求め、|t|+余裕 を採用
+      denom_ba = a_n.dot(b_n)
+      push_b = if denom_ba.abs >= 1e-6
+                 t_b = -a_n.dot(b_pt - a_pt) / denom_ba
+                 t_b.abs + 1000.mm
+               else
+                 fallback_dist
+               end
+
+      # ---- ③ waste_pt を絶対固定 ------------------------------------
+      # plane_pt.offset(plane_n, 1000mm) により、
+      # build_half_space_cutter 内の dot = plane_n.dot(waste_pt - plane_pt)
+      # = plane_n.dot(plane_n * 1000mm) = 1000mm > 0 が確実に保証される。
+      # PushPull 後に面が移動しても、元の法線方向を固定するためブレない。
+      waste_pt_a = a_pt.offset(a_n, 1000.mm)  # cutter_a（B を削る刃）の方向指定
+      waste_pt_b = b_pt.offset(b_n, 1000.mm)  # cutter_b（A を削る刃）の方向指定
 
       model.start_operation('Corner Solid', true)
       cutter_a = nil
       cutter_b = nil
 
       begin
-        # ---- ① ComponentInstance を固有化 --------------------------------
+        # ---- make_unique: ComponentInstance を固有化 --------------------
         member_a.make_unique if member_a.is_a?(Sketchup::ComponentInstance)
         member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
 
-        # ---- ② make_unique 後にカット面オブジェクトを再取得 ----------------
+        # ---- make_unique 後にカット面オブジェクトを再取得 ----------------
         face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
-        raise '部材Aのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_a.nil?
+        raise '部材Aのカット面を取得できませんでした（make_unique 後）' if face_a.nil?
 
         face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
-        raise '部材Bのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_b.nil?
+        raise '部材Bのカット面を取得できませんでした（make_unique 後）' if face_b.nil?
 
-        # ---- ③ PushPull: t値ベースの距離で強制延伸 -----------------------
+        # ---- ② PushPull: 相手境界面まで確実に交差する距離で延伸 ----------
         puts "[CornerTool] execute_corner: PushPull " \
-             "A=#{overshoot_a.to_f.round(1)}in B=#{overshoot_b.to_f.round(1)}in"
-        face_a.pushpull(overshoot_a)
-        face_b.pushpull(overshoot_b)
+             "A=#{push_a.to_f.round(1)}in B=#{push_b.to_f.round(1)}in"
+        face_a.pushpull(push_a)
+        face_b.pushpull(push_b)
 
-        # ---- ④ ハーフスペースカッターを生成 --------------------------------
-        # waste_pt: 延伸した余分な側にある点（build_half_space_cutter の方向決定用）
-        waste_pt_a = a_pt.offset(a_n, overshoot_a)
-        waste_pt_b = b_pt.offset(b_n, overshoot_b)
+        # ---- ④ カッター生成 -------------------------------------------
+        # cutter_a: A の面（a_pt, a_n）を境界として member_b の余分をトリム
+        cutter_a = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_a)
+        raise 'カッターA（部材B 用）の生成に失敗しました' if cutter_a.nil?
 
-        cutter_a = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_a)
-        raise 'カッターA（部材A 用）の生成に失敗しました' if cutter_a.nil?
+        # cutter_b: B の面（b_pt, b_n）を境界として member_a の余分をトリム
+        cutter_b = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_b)
+        raise 'カッターB（部材A 用）の生成に失敗しました' if cutter_b.nil?
 
-        cutter_b = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_b)
-        raise 'カッターB（部材B 用）の生成に失敗しました' if cutter_b.nil?
-
-        # ---- ⑤ 相互 subtract -------------------------------------------
-        puts '[CornerTool] execute_corner: cutter_a.subtract(member_a) 実行中...'
-        res_a    = cutter_a.subtract(member_a)
+        # ---- ④ 相互 subtract ------------------------------------------
+        puts '[CornerTool] execute_corner: cutter_a.subtract(member_b) 実行中...'
+        res_b    = cutter_a.subtract(member_b)
         cutter_a = nil
-        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
-
-        puts '[CornerTool] execute_corner: cutter_b.subtract(member_b) 実行中...'
-        res_b    = cutter_b.subtract(member_b)
-        cutter_b = nil
         raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
 
-        # ---- ⑥ 共面エッジのクリーンアップ ---------------------------------
+        puts '[CornerTool] execute_corner: cutter_b.subtract(member_a) 実行中...'
+        res_a    = cutter_b.subtract(member_a)
+        cutter_b = nil
+        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
+
+        # ---- ⑤ 共面エッジのクリーンアップ & コミット --------------------
         cleanup_coplanar_edges(res_a)
         cleanup_coplanar_edges(res_b)
 
