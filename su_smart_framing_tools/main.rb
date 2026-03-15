@@ -40,7 +40,7 @@ module SuSmartFramingTools
     TOOL_DEFS = [
       { label: 'トリム (Trim)',       icon: 'trim',   klass: TrimTool   },
       { label: '分割 (Split)',        icon: 'split',  klass: SplitTool  },
-      { label: '位置合わせ (Align)',  icon: 'align',  klass: nil        },
+      { label: '位置合わせ (Align)',  icon: 'align',  klass: AlignTool  },
       { label: '包絡 (Corner)',       icon: 'corner', klass: nil        },
       { label: '延長 (Extend)',       icon: 'extend', klass: nil        },
     ].freeze
