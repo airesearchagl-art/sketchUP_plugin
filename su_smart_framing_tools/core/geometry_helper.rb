@@ -148,7 +148,9 @@ module SuSmartFramingTools
         # dot = plane_n · (click_pt - plane_pt)
         # 正値 → フェイス法線がクリック点方向を向く → 削除側の境界面
         dot = normal_world.dot(click_pt - center_world)
-        next if dot <= 0.0
+        # -1e-6 の余裕を持たせることで、カーソルがエッジや頂点に触れたときでも
+        # 隣接面（dot ≈ 0）を拾えるようにする（シビアすぎる反応を防ぐ）
+        next if dot < -1e-6
 
         dist = center_world.distance(click_pt)
         if dist < best_dist
@@ -163,6 +165,40 @@ module SuSmartFramingTools
              "(フェイス数=#{face_count})"
       end
       best
+    end
+
+    # ----------------------------------------------------------------
+    # カット面の Sketchup::Face オブジェクトを返す（find_cut_face の Face 返し版）
+    #
+    # find_cut_face と同じロジックで「click_pt 方向を向く最近接面」を探し、
+    # Sketchup::Face オブジェクト自体を返す。
+    # make_unique 後に有効な Face 参照を取得するために使用する。
+    #
+    # @return [Sketchup::Face, nil]
+    # ----------------------------------------------------------------
+    def find_cut_face_object(entity, click_pt, entity_transform: nil)
+      ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
+      transform = entity_transform || entity.transformation
+
+      best_face = nil
+      best_dist = Float::INFINITY
+
+      ents.grep(Sketchup::Face).each do |face|
+        center_world = face.bounds.center.transform(transform)
+        normal_world = face.normal.transform(transform)
+        normal_world.normalize!
+
+        dot = normal_world.dot(click_pt - center_world)
+        next if dot < -1e-6
+
+        dist = center_world.distance(click_pt)
+        if dist < best_dist
+          best_dist = dist
+          best_face = face
+        end
+      end
+
+      best_face
     end
 
     # ----------------------------------------------------------------

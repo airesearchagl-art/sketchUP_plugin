@@ -80,7 +80,7 @@ module SuSmartFramingTools
     # ----------------------------------------------------------------
     def onMouseMove(_flags, x, y, view)
       ph = view.pick_helper
-      ph.do_pick(x, y)
+      ph.do_pick(x, y, 5)  # aperture 5px: エッジ/頂点近傍でも確実にピック
       hovered, = pick_solid_with_transform(ph)
 
       case @state

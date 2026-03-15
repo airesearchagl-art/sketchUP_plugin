@@ -62,7 +62,7 @@ module SuSmartFramingTools
     # ----------------------------------------------------------------
     def onMouseMove(_flags, x, y, view)
       ph = view.pick_helper
-      ph.do_pick(x, y)
+      ph.do_pick(x, y, 5)  # aperture 5px: エッジ/頂点近傍でも確実にピック
       hovered, hovered_tf = pick_solid_with_transform(ph)
 
       ip = Sketchup::InputPoint.new
@@ -231,21 +231,40 @@ module SuSmartFramingTools
     end
 
     # ----------------------------------------------------------------
-    # 強制交差＆相互トリムによるコーナー処理（execute_corner）
+    # t値ベースの強制延伸＆相互トリムによるコーナー処理（execute_corner）
     #
     # ① make_unique（ComponentInstance を固有化）
     # ② カット面オブジェクトを再取得（make_unique 後に定義が変わるため）
-    # ③ PushPull: クリックされた面を PUSH_DIST 押し出して強制交差
-    # ④ build_half_space_cutter: キャッシュ済みの「元の面位置」からカッターを生成
-    #    → PushPull で延びた余分な部分も含めて元の境界面より先を全て除去
+    # ③ PushPull: t値で「相手境界面まで到達する距離 + 余裕」を算出して延伸
+    #    - denom = b_n.dot(a_n) が 0 に近い（面が平行/垂直）場合は対角線ベースのフォールバック
+    # ④ build_half_space_cutter で相手境界面からカッターを生成
     # ⑤ subtract × 2 → cleanup × 2 → commit
     # ----------------------------------------------------------------
-    PUSH_DIST = 10_000.mm  # 未交差ケースを確実にカバーする押し出し距離
-
     def execute_corner(member_a, member_a_tf, click_pt_a, cut_info_a,
                        member_b, member_b_tf, click_pt_b, cut_info_b,
                        view)
       model = Sketchup.active_model
+
+      a_pt = cut_info_a[:center]
+      a_n  = cut_info_a[:normal].clone
+      b_pt = cut_info_b[:center]
+      b_n  = cut_info_b[:normal].clone
+
+      diag_a        = member_a.bounds.min.distance(member_a.bounds.max)
+      diag_b        = member_b.bounds.min.distance(member_b.bounds.max)
+      fallback_dist = [diag_a, diag_b].max * 2 + 1000.mm
+
+      denom = b_n.dot(a_n)
+      if denom.abs >= 1e-6
+        t_a = -b_n.dot(a_pt - b_pt) / denom
+        t_b = -a_n.dot(b_pt - a_pt) / denom
+        overshoot_a = t_a.abs + 1000.mm
+        overshoot_b = t_b.abs + 1000.mm
+      else
+        overshoot_a = fallback_dist
+        overshoot_b = fallback_dist
+      end
+
       model.start_operation('Corner Solid', true)
       cutter_a = nil
       cutter_b = nil
@@ -256,45 +275,39 @@ module SuSmartFramingTools
         member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
 
         # ---- ② make_unique 後にカット面オブジェクトを再取得 ----------------
-        # make_unique により定義が差し替わるため、保存済みの Face 参照は無効になる可能性がある。
-        # cut_info（ワールド座標の中心・法線）は数値なので引き続き有効。
         face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
         raise '部材Aのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_a.nil?
 
         face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
         raise '部材Bのカット面オブジェクトを取得できませんでした（make_unique 後）' if face_b.nil?
 
-        # ---- ③ PushPull: 両部材を強制的に延伸して交差させる ----------------
-        # face.pushpull(dist) は面のローカル法線方向に dist だけ押し出す。
-        # find_cut_face_object はワールド法線が click_pt 方向を向く面（外向き面）を返すため、
-        # 正の dist で部材が click_pt 方向（削除したい側）へ延伸される。
-        puts "[CornerTool] execute_corner: PushPull 実行 dist=#{PUSH_DIST.to_f.round(1)}mm"
-        face_a.pushpull(PUSH_DIST)
-        face_b.pushpull(PUSH_DIST)
+        # ---- ③ PushPull: t値ベースの距離で強制延伸 -----------------------
+        puts "[CornerTool] execute_corner: PushPull " \
+             "A=#{overshoot_a.to_f.round(1)}in B=#{overshoot_b.to_f.round(1)}in"
+        face_a.pushpull(overshoot_a)
+        face_b.pushpull(overshoot_b)
 
         # ---- ④ ハーフスペースカッターを生成 --------------------------------
-        # cut_info_a / cut_info_b は PushPull 前の「元の面位置」のため、
-        # 延ばした余分な部分を含めて元の境界面より先を全て除去できる。
-        n_a      = cut_info_a[:normal].clone
-        cutter_a = build_half_space_cutter(model, cut_info_a[:center], n_a,
-                                           member_b, click_pt_a)
-        raise 'カッターA（部材B 用）の生成に失敗しました' if cutter_a.nil?
+        # waste_pt: 延伸した余分な側にある点（build_half_space_cutter の方向決定用）
+        waste_pt_a = a_pt.offset(a_n, overshoot_a)
+        waste_pt_b = b_pt.offset(b_n, overshoot_b)
 
-        n_b      = cut_info_b[:normal].clone
-        cutter_b = build_half_space_cutter(model, cut_info_b[:center], n_b,
-                                           member_a, click_pt_b)
-        raise 'カッターB（部材A 用）の生成に失敗しました' if cutter_b.nil?
+        cutter_a = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_a)
+        raise 'カッターA（部材A 用）の生成に失敗しました' if cutter_a.nil?
+
+        cutter_b = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_b)
+        raise 'カッターB（部材B 用）の生成に失敗しました' if cutter_b.nil?
 
         # ---- ⑤ 相互 subtract -------------------------------------------
-        puts '[CornerTool] execute_corner: cutter_a.subtract(member_b) 実行中...'
-        res_b    = cutter_a.subtract(member_b)
+        puts '[CornerTool] execute_corner: cutter_a.subtract(member_a) 実行中...'
+        res_a    = cutter_a.subtract(member_a)
         cutter_a = nil
-        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
-
-        puts '[CornerTool] execute_corner: cutter_b.subtract(member_a) 実行中...'
-        res_a    = cutter_b.subtract(member_a)
-        cutter_b = nil
         raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
+
+        puts '[CornerTool] execute_corner: cutter_b.subtract(member_b) 実行中...'
+        res_b    = cutter_b.subtract(member_b)
+        cutter_b = nil
+        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
 
         # ---- ⑥ 共面エッジのクリーンアップ ---------------------------------
         cleanup_coplanar_edges(res_a)
@@ -308,47 +321,13 @@ module SuSmartFramingTools
 
       rescue RuntimeError => e
         model.abort_operation
-        cutter_a = nil
-        cutter_b = nil
+        cutter_a&.erase! if cutter_a&.valid?
+        cutter_b&.erase! if cutter_b&.valid?
         puts "[CornerTool] execute_corner エラー: #{e.message}"
         UI.messagebox("コーナー処理失敗：\n#{e.message}", MB_OK)
       end
 
       view.invalidate
-    end
-
-    # ----------------------------------------------------------------
-    # カット面の Face オブジェクトを返す（GeometryHelper#find_cut_face の Face 返し版）
-    #
-    # find_cut_face と同じロジックで「click_pt 方向を向く最近接面」を探し、
-    # そのワールド座標情報ではなく Sketchup::Face オブジェクト自体を返す。
-    # make_unique 後に呼ぶことで有効な Face 参照を取得できる。
-    #
-    # @return [Sketchup::Face, nil]
-    # ----------------------------------------------------------------
-    def find_cut_face_object(entity, click_pt, entity_transform: nil)
-      ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
-      transform = entity_transform || entity.transformation
-
-      best_face = nil
-      best_dist = Float::INFINITY
-
-      ents.grep(Sketchup::Face).each do |face|
-        center_world = face.bounds.center.transform(transform)
-        normal_world = face.normal.transform(transform)
-        normal_world.normalize!
-
-        dot = normal_world.dot(click_pt - center_world)
-        next if dot <= 0.0
-
-        dist = center_world.distance(click_pt)
-        if dist < best_dist
-          best_dist = dist
-          best_face = face
-        end
-      end
-
-      best_face
     end
 
     # ----------------------------------------------------------------

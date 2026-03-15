@@ -70,7 +70,7 @@ module SuSmartFramingTools
     # ----------------------------------------------------------------
     def onMouseMove(_flags, x, y, view)
       ph = view.pick_helper
-      ph.do_pick(x, y)
+      ph.do_pick(x, y, 5)
       hovered, hovered_tf = pick_solid_with_transform(ph)
 
       ip = Sketchup::InputPoint.new
@@ -325,39 +325,6 @@ module SuSmartFramingTools
       end
 
       view.invalidate
-    end
-
-    # ----------------------------------------------------------------
-    # カット面 Face オブジェクトを返す（GeometryHelper#find_cut_face の Face 返し版）
-    #
-    # make_unique 後に有効な Face 参照を取得するために使用する。
-    # 「click_pt 方向を向く最近接面」を探して Sketchup::Face を返す。
-    #
-    # @return [Sketchup::Face, nil]
-    # ----------------------------------------------------------------
-    def find_cut_face_object(entity, click_pt, entity_transform: nil)
-      ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
-      transform = entity_transform || entity.transformation
-
-      best_face = nil
-      best_dist = Float::INFINITY
-
-      ents.grep(Sketchup::Face).each do |face|
-        center_world = face.bounds.center.transform(transform)
-        normal_world = face.normal.transform(transform)
-        normal_world.normalize!
-
-        dot = normal_world.dot(click_pt - center_world)
-        next if dot <= 0.0
-
-        dist = center_world.distance(click_pt)
-        if dist < best_dist
-          best_dist = dist
-          best_face = face
-        end
-      end
-
-      best_face
     end
 
     # ----------------------------------------------------------------
