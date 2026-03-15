@@ -42,7 +42,7 @@ module SuSmartFramingTools
       { label: '分割 (Split)',        icon: 'split',  klass: SplitTool  },
       { label: '位置合わせ (Align)',  icon: 'align',  klass: AlignTool  },
       { label: '包絡 (Corner)',       icon: 'corner', klass: CornerTool },
-      { label: '延長 (Extend)',       icon: 'extend', klass: nil        },
+      { label: '延長 (Extend)',       icon: 'extend', klass: ExtendTool },
     ].freeze
 
     # ツール起動ブロックを生成するヘルパー
