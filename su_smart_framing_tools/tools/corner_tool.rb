@@ -185,7 +185,7 @@ module SuSmartFramingTools
 
       cut_info = find_cut_face(entity, click_pt, cutter_transform: entity_tf)
       if cut_info.nil?
-        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側をクリックしてください。'
+        Sketchup.status_text = '警告：小口面を検出できませんでした。部材の小口（先端の面）をクリックしてください。'
         return
       end
 
@@ -220,7 +220,7 @@ module SuSmartFramingTools
 
       cut_info_b = find_cut_face(entity, click_pt, cutter_transform: entity_tf)
       if cut_info_b.nil?
-        Sketchup.status_text = '警告：カット面を検出できませんでした。削除したい側をクリックしてください。'
+        Sketchup.status_text = '警告：小口面を検出できませんでした。部材の小口（先端の面）をクリックしてください。'
         return
       end
 
@@ -248,6 +248,19 @@ module SuSmartFramingTools
                        member_b, member_b_tf, click_pt_b, cut_info_b,
                        view)
       model = Sketchup.active_model
+
+      # ──────────────────────────────────────────────────────────────
+      # 事前バリデーション: 両部材がソリッドであることを確認
+      # subtract はソリッドでない場合に nil を返すため、ここで早期ガードする
+      # ──────────────────────────────────────────────────────────────
+      unless manifold?(member_a)
+        UI.messagebox("部材Aがソリッドグループではありません。\nソリッドグループ/コンポーネントを選択してください。", MB_OK)
+        return
+      end
+      unless manifold?(member_b)
+        UI.messagebox("部材Bがソリッドグループではありません。\nソリッドグループ/コンポーネントを選択してください。", MB_OK)
+        return
+      end
 
       # ──────────────────────────────────────────────────────────────
       # ① 幾何データの完全退避（Entity 参照に依存しない純粋な数値）
@@ -285,7 +298,7 @@ module SuSmartFramingTools
         # ──────────────────────────────────────────────────────────
         member_a.make_unique if member_a.is_a?(Sketchup::ComponentInstance)
         face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
-        raise '部材Aのカット面を取得できませんでした（make_unique 後）' if face_a.nil?
+        raise '部材Aの小口面を取得できませんでした。小口（先端の面）をクリックしてください。' if face_a.nil?
         face_a.pushpull(push_a)
         # face_a は pushpull 後に無効化されるが以降は使用しない
         puts "[CornerTool] PushPull A 完了: #{push_a.to_f.round(1)}in"
@@ -295,7 +308,7 @@ module SuSmartFramingTools
         # ──────────────────────────────────────────────────────────
         member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
         face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
-        raise '部材Bのカット面を取得できませんでした（make_unique 後）' if face_b.nil?
+        raise '部材Bの小口面を取得できませんでした。小口（先端の面）をクリックしてください。' if face_b.nil?
         face_b.pushpull(push_b)
         puts "[CornerTool] PushPull B 完了: #{push_b.to_f.round(1)}in"
 
@@ -310,6 +323,13 @@ module SuSmartFramingTools
         member_b = cutter.subtract(member_b)   # 戻り値で更新（古い member_b は削除済み）
         cutter   = nil
         raise 'ブーリアン演算（部材B のトリム）が失敗しました' if member_b.nil?
+
+        # ── 部材A が 1 本目の subtract 後もまだ有効なソリッドか確認 ────
+        # SketchUp の内部 Entity 再編成で参照が壊れていた場合は即時中断する
+        unless member_a.valid? && manifold?(member_a)
+          raise '部材Aが1本目のトリム後に無効化されました。' \
+                '部材が正しいソリッドグループか確認してください。'
+        end
 
         # ──────────────────────────────────────────────────────────
         # Atomic Step 4: cutter_b 生成 → member_a をトリム → 参照を更新
@@ -398,9 +418,9 @@ module SuSmartFramingTools
     def status_message
       case @state
       when :select_member_a
-        '【包絡】1. 1つ目の部材の「削除したい側」をクリックしてください'
+        '【包絡】1. 1つ目の部材の小口（先端の面）をクリックしてください'
       when :select_member_b
-        '【包絡】2. 2つ目の部材の「削除したい側」をクリックしてください（ESC で部材A 再選択）'
+        '【包絡】2. 2つ目の部材の小口（先端の面）をクリックしてください（ESC で部材A 再選択）'
       else
         '処理中...'
       end
