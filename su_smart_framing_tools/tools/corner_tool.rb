@@ -270,10 +270,10 @@ module SuSmartFramingTools
       b_pt = cut_info_b[:center].clone
       b_n  = cut_info_b[:normal].clone
 
-      # waste_pt: 元の法線方向に 1000mm 固定オフセット
-      # → build_half_space_cutter 内 dot = n.dot(waste_pt - pt) = n.dot(n*1000) = 1000 > 0 を保証
-      waste_pt_a = a_pt.offset(a_n, 1000.mm)   # cutter_a（B を削る刃）の方向基準点
-      waste_pt_b = b_pt.offset(b_n, 1000.mm)   # cutter_b（A を削る刃）の方向基準点
+      # waste_pt: 元の法線方向に 5000mm 固定オフセット（部材が大きい場合でも体内に留まらない距離）
+      # → build_half_space_cutter 内 dot = n.dot(waste_pt - pt) = n.dot(n*5000) = 5000 > 0 を保証
+      waste_pt_a = a_pt.offset(a_n, 5000.mm)   # cutter_a（B を削る刃）の方向基準点
+      waste_pt_b = b_pt.offset(b_n, 5000.mm)   # cutter_b（A を削る刃）の方向基準点
 
       # PushPull 距離: |t値| + 1000mm（確実に相手平面を突き抜ける量）
       diag_a        = member_a.bounds.min.distance(member_a.bounds.max)
@@ -320,9 +320,11 @@ module SuSmartFramingTools
         raise 'カッターA（部材B 用）の生成に失敗しました' if cutter.nil?
 
         puts '[CornerTool] cutter_a.subtract(member_b) 実行中...'
-        member_b = cutter.subtract(member_b)   # 戻り値で更新（古い member_b は削除済み）
-        cutter   = nil
-        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if member_b.nil?
+        res_b  = cutter.subtract(member_b)     # 戻り値を明示的に受け取る
+        cutter = nil
+        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
+        member_b = res_b
+        raise '部材B のトリム結果が無効です' unless member_b.valid?
 
         # ── 部材A が 1 本目の subtract 後もまだ有効なソリッドか確認 ────
         # SketchUp の内部 Entity 再編成で参照が壊れていた場合は即時中断する
@@ -340,9 +342,11 @@ module SuSmartFramingTools
         raise 'カッターB（部材A 用）の生成に失敗しました' if cutter.nil?
 
         puts '[CornerTool] cutter_b.subtract(member_a) 実行中...'
-        member_a = cutter.subtract(member_a)   # 戻り値で更新（古い member_a は削除済み）
-        cutter   = nil
-        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if member_a.nil?
+        res_a  = cutter.subtract(member_a)     # 戻り値を明示的に受け取る
+        cutter = nil
+        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
+        member_a = res_a
+        raise '部材A のトリム結果が無効です' unless member_a.valid?
 
         # ──────────────────────────────────────────────────────────
         # ③ 共面エッジのクリーンアップ & コミット

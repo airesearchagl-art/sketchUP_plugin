@@ -121,40 +121,48 @@ module SuSmartFramingTools
     # カッターソリッドのフェイス群を走査し、以下の条件を満たすフェイスを選択:
     #   plane_n.dot(click_pt - plane_pt) > 0
     #   （フェイス法線がクリック点方向を向く = 削除側の境界面）
-    # 条件を満たす候補の中からクリック点に最も近いフェイスを返す。
+    #
+    # 選定スコア（小口優先）:
+    #   部材の長手方向（バウンディングボックスの最長軸）に法線が揃っている面
+    #   ＝ 小口（端面）を優先的に選択する。
+    #   adjusted_dist = dist / (1 + endface_score * 3)
+    #   endface_score = |normal · long_axis|（端面ほど 1 に近い）
+    #   これにより端面は最大 4 倍「近く」評価され、長手側面より優先される。
     #
     # cutter_transform: カッターのグローバル変換行列（nil の場合は cutter.transformation を使用）
-    #   ネストされた親グループがある場合に pick_solid_with_transform で取得した累積変換を渡す。
     # quiet: true にすると puts を抑制する（onMouseMove からの連続呼び出し用）
     #
     # @return [Hash] { center: Geom::Point3d, normal: Geom::Vector3d, dot: Float } or nil
     # ----------------------------------------------------------------
     def find_cut_face(cutter, click_pt, cutter_transform: nil, quiet: false)
       entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
-      # グローバル変換が渡された場合はそれを優先（ネスト対応）
-      # nil の場合は entity.transformation にフォールバック
       transform = cutter_transform || cutter.transformation
 
-      best      = nil
-      best_dist = Float::INFINITY
+      # 部材の長手方向（世界座標系 AABB の最長軸）を特定
+      bb = cutter.bounds
+      long_axis = [[bb.width,  Geom::Vector3d.new(1, 0, 0)],
+                   [bb.height, Geom::Vector3d.new(0, 1, 0)],
+                   [bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |size, _| size }[1]
+
+      best       = nil
+      best_score = Float::INFINITY
 
       entities.grep(Sketchup::Face).each do |face|
-        # フェイスの中心と法線をワールド座標に変換
         center_world = face.bounds.center.transform(transform)
         normal_world = face.normal.transform(transform)
         normal_world.normalize!
 
-        # 内積による方向判定:
-        # dot = plane_n · (click_pt - plane_pt)
-        # 正値 → フェイス法線がクリック点方向を向く → 削除側の境界面
         dot = normal_world.dot(click_pt - center_world)
-        # -1e-6 の余裕を持たせることで、カーソルがエッジや頂点に触れたときでも
-        # 隣接面（dot ≈ 0）を拾えるようにする（シビアすぎる反応を防ぐ）
         next if dot < -1e-6
 
         dist = center_world.distance(click_pt)
-        if dist < best_dist
-          best_dist = dist
+        # 小口スコア: 法線が長手軸と平行なほど 1 に近い（端面 = 1、長手側面 ≈ 0）
+        endface_score = normal_world.dot(long_axis).abs
+        # 小口優先の調整距離: 端面は最大 4x 近く評価される
+        adjusted_dist = dist / (1.0 + endface_score * 3.0)
+
+        if adjusted_dist < best_score
+          best_score = adjusted_dist
           best = { center: center_world, normal: normal_world, dot: dot }
         end
       end
@@ -170,8 +178,7 @@ module SuSmartFramingTools
     # ----------------------------------------------------------------
     # カット面の Sketchup::Face オブジェクトを返す（find_cut_face の Face 返し版）
     #
-    # find_cut_face と同じロジックで「click_pt 方向を向く最近接面」を探し、
-    # Sketchup::Face オブジェクト自体を返す。
+    # find_cut_face と同じ小口優先スコアリングで Face オブジェクトを返す。
     # make_unique 後に有効な Face 参照を取得するために使用する。
     #
     # @return [Sketchup::Face, nil]
@@ -180,8 +187,13 @@ module SuSmartFramingTools
       ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
       transform = entity_transform || entity.transformation
 
-      best_face = nil
-      best_dist = Float::INFINITY
+      bb = entity.bounds
+      long_axis = [[bb.width,  Geom::Vector3d.new(1, 0, 0)],
+                   [bb.height, Geom::Vector3d.new(0, 1, 0)],
+                   [bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |size, _| size }[1]
+
+      best_face  = nil
+      best_score = Float::INFINITY
 
       ents.grep(Sketchup::Face).each do |face|
         center_world = face.bounds.center.transform(transform)
@@ -191,10 +203,13 @@ module SuSmartFramingTools
         dot = normal_world.dot(click_pt - center_world)
         next if dot < -1e-6
 
-        dist = center_world.distance(click_pt)
-        if dist < best_dist
-          best_dist = dist
-          best_face = face
+        dist          = center_world.distance(click_pt)
+        endface_score = normal_world.dot(long_axis).abs
+        adjusted_dist = dist / (1.0 + endface_score * 3.0)
+
+        if adjusted_dist < best_score
+          best_score = adjusted_dist
+          best_face  = face
         end
       end
 
