@@ -138,11 +138,17 @@ module SuSmartFramingTools
       entities  = cutter.is_a?(Sketchup::Group) ? cutter.entities : cutter.definition.entities
       transform = cutter_transform || cutter.transformation
 
-      # 部材の長手方向（世界座標系 AABB の最長軸）を特定
-      bb = cutter.bounds
-      long_axis = [[bb.width,  Geom::Vector3d.new(1, 0, 0)],
-                   [bb.height, Geom::Vector3d.new(0, 1, 0)],
-                   [bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |size, _| size }[1]
+      # 部材の長手方向: ローカル座標 BB（definition.bounds）から最長軸を特定し
+      # ワールド座標へ変換することで、回転した部材でも正しい長手軸が得られる
+      local_bb        = cutter.definition.bounds
+      long_axis_local = [[local_bb.width,  Geom::Vector3d.new(1, 0, 0)],
+                         [local_bb.height, Geom::Vector3d.new(0, 1, 0)],
+                         [local_bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |s, _| s }[1]
+      long_axis = long_axis_local.transform(transform)
+      long_axis.normalize!
+
+      # 外向き法線ガード用: ソリッドのワールド座標中心
+      solid_center = cutter.bounds.center
 
       best       = nil
       best_score = Float::INFINITY
@@ -151,6 +157,10 @@ module SuSmartFramingTools
         center_world = face.bounds.center.transform(transform)
         normal_world = face.normal.transform(transform)
         normal_world.normalize!
+
+        # 外向き法線ガード: 面中心→ソリッド中心ベクトルと法線が逆向き = 内向き → スキップ
+        outward_vec = center_world - solid_center
+        next if outward_vec.length > 0.1.mm && normal_world.dot(outward_vec) < 0
 
         dot = normal_world.dot(click_pt - center_world)
         next if dot < -1e-6
@@ -187,10 +197,14 @@ module SuSmartFramingTools
       ents      = entity.is_a?(Sketchup::Group) ? entity.entities : entity.definition.entities
       transform = entity_transform || entity.transformation
 
-      bb = entity.bounds
-      long_axis = [[bb.width,  Geom::Vector3d.new(1, 0, 0)],
-                   [bb.height, Geom::Vector3d.new(0, 1, 0)],
-                   [bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |size, _| size }[1]
+      local_bb        = entity.definition.bounds
+      long_axis_local = [[local_bb.width,  Geom::Vector3d.new(1, 0, 0)],
+                         [local_bb.height, Geom::Vector3d.new(0, 1, 0)],
+                         [local_bb.depth,  Geom::Vector3d.new(0, 0, 1)]].max_by { |s, _| s }[1]
+      long_axis = long_axis_local.transform(transform)
+      long_axis.normalize!
+
+      solid_center = entity.bounds.center
 
       best_face  = nil
       best_score = Float::INFINITY
@@ -199,6 +213,9 @@ module SuSmartFramingTools
         center_world = face.bounds.center.transform(transform)
         normal_world = face.normal.transform(transform)
         normal_world.normalize!
+
+        outward_vec = center_world - solid_center
+        next if outward_vec.length > 0.1.mm && normal_world.dot(outward_vec) < 0
 
         dot = normal_world.dot(click_pt - center_world)
         next if dot < -1e-6
@@ -229,7 +246,7 @@ module SuSmartFramingTools
     #
     # @return [Sketchup::Group] カッターボックス、または nil（失敗時）
     # ----------------------------------------------------------------
-    def build_half_space_cutter(model, plane_pt, plane_n, target, click_pt)
+    def build_half_space_cutter(parent_entities, plane_pt, plane_n, target, click_pt)
       bb = target.bounds
 
       # 内積による延伸方向の確認と延伸距離の動的決定
@@ -258,7 +275,7 @@ module SuSmartFramingTools
         plane_pt.offset(perp1).offset(perp2.reverse),
       ]
 
-      g    = model.active_entities.add_group
+      g    = parent_entities.add_group
       face = g.entities.add_face(pts)
       face.reverse! if face.normal.dot(plane_n) < 0
       face.pushpull(extend_dist)
@@ -304,6 +321,26 @@ module SuSmartFramingTools
 
       to_delete.each { |e| e.erase! if e.valid? }
       puts "[GeometryHelper] cleanup_coplanar_edges: #{to_delete.length} 個の共面エッジを削除"
+    end
+
+    # ----------------------------------------------------------------
+    # カッターを生成する親 Entities と ワールド→親ローカル変換を返す
+    #
+    # subtract はカッターとターゲットが同じ親 Entities 内にある必要がある。
+    # このメソッドはターゲット部材の parent Entities（Sketchup::Entities）と、
+    # ワールド座標を親ローカル座標へ変換する Transformation を返す。
+    #
+    # トップレベル部材: parent = model.entities、変換 = 単位行列
+    # グループ内部材:   parent = グループ entities、変換 = グループ変換の逆
+    #
+    # @param member          [Sketchup::Group, Sketchup::ComponentInstance]
+    # @param member_world_tf [Geom::Transformation] member のワールド変換
+    # @return [Array(Sketchup::Entities, Geom::Transformation)]
+    #         [parent_entities, world_to_parent_local_tf]
+    # ----------------------------------------------------------------
+    def cutter_context(member, member_world_tf)
+      parent_world_tf = member_world_tf * member.transformation.inverse
+      [member.parent, parent_world_tf.inverse]
     end
   end
 end

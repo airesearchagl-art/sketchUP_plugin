@@ -316,7 +316,13 @@ module SuSmartFramingTools
         # Atomic Step 3: cutter_a 生成 → member_b をトリム → 参照を更新
         # （cutter 生成 & subtract を一組で実行し古い参照を即座に破棄）
         # ──────────────────────────────────────────────────────────
-        cutter = build_half_space_cutter(model, a_pt, a_n, member_b, waste_pt_a)
+        b_parent_ents, b_parent_inv = cutter_context(member_b, member_b_tf)
+        b_local_pt    = a_pt.transform(b_parent_inv)
+        b_local_n     = a_n.transform(b_parent_inv)
+        b_local_n.normalize!
+        b_local_waste = waste_pt_a.transform(b_parent_inv)
+        cutter = build_half_space_cutter(b_parent_ents, b_local_pt, b_local_n,
+                                         member_b, b_local_waste)
         raise 'カッターA（部材B 用）の生成に失敗しました' if cutter.nil?
 
         puts '[CornerTool] cutter_a.subtract(member_b) 実行中...'
@@ -338,7 +344,13 @@ module SuSmartFramingTools
         # Step 3 の subtract 完了後に生成することで
         # SketchUp 内部の Entity 再編成による参照破壊を防ぐ
         # ──────────────────────────────────────────────────────────
-        cutter = build_half_space_cutter(model, b_pt, b_n, member_a, waste_pt_b)
+        a_parent_ents, a_parent_inv = cutter_context(member_a, member_a_tf)
+        a_local_pt    = b_pt.transform(a_parent_inv)
+        a_local_n     = b_n.transform(a_parent_inv)
+        a_local_n.normalize!
+        a_local_waste = waste_pt_b.transform(a_parent_inv)
+        cutter = build_half_space_cutter(a_parent_ents, a_local_pt, a_local_n,
+                                         member_a, a_local_waste)
         raise 'カッターB（部材A 用）の生成に失敗しました' if cutter.nil?
 
         puts '[CornerTool] cutter_b.subtract(member_a) 実行中...'

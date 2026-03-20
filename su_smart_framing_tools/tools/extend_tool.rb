@@ -295,9 +295,13 @@ module SuSmartFramingTools
         waste_click_pt = face_center_world.offset(face_normal_world, overshoot_dist)
 
         # ---- ⑦ ハーフスペースカッターを生成してトリム ---------------
-        n_b    = b_n.clone
-        cutter = build_half_space_cutter(model, b_pt, n_b,
-                                         target_entity, waste_click_pt)
+        target_parent_ents, target_parent_inv = cutter_context(target_entity, target_entity_tf)
+        local_b_pt     = b_pt.transform(target_parent_inv)
+        local_b_n      = b_n.transform(target_parent_inv)
+        local_b_n.normalize!
+        local_waste_pt = waste_click_pt.transform(target_parent_inv)
+        cutter = build_half_space_cutter(target_parent_ents, local_b_pt, local_b_n,
+                                         target_entity, local_waste_pt)
         raise '境界カッターの生成に失敗しました' if cutter.nil?
 
         puts '[ExtendTool] execute_extend: cutter.subtract(target) 実行中...'
