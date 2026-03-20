@@ -299,9 +299,12 @@ module SuSmartFramingTools
         member_a.make_unique if member_a.is_a?(Sketchup::ComponentInstance)
         face_a = find_cut_face_object(member_a, click_pt_a, entity_transform: member_a_tf)
         raise '部材Aの小口面を取得できませんでした。小口（先端の面）をクリックしてください。' if face_a.nil?
-        face_a.pushpull(push_a)
+        # スケール補正: ワールド距離 → ローカル距離（face.normal をワールド変換した長さ = スケール倍率）
+        scale_a = face_a.normal.transform(member_a_tf).length
+        scale_a = 1.0 if scale_a < 1e-6
+        face_a.pushpull(push_a / scale_a)
         # face_a は pushpull 後に無効化されるが以降は使用しない
-        puts "[CornerTool] PushPull A 完了: #{push_a.to_f.round(1)}in"
+        puts "[CornerTool] PushPull A 完了: world=#{push_a.to_f.round(1)}in local=#{(push_a / scale_a).to_f.round(1)}in"
 
         # ──────────────────────────────────────────────────────────
         # Atomic Step 2: 部材B — make_unique → face 再取得 → PushPull
@@ -309,8 +312,10 @@ module SuSmartFramingTools
         member_b.make_unique if member_b.is_a?(Sketchup::ComponentInstance)
         face_b = find_cut_face_object(member_b, click_pt_b, entity_transform: member_b_tf)
         raise '部材Bの小口面を取得できませんでした。小口（先端の面）をクリックしてください。' if face_b.nil?
-        face_b.pushpull(push_b)
-        puts "[CornerTool] PushPull B 完了: #{push_b.to_f.round(1)}in"
+        scale_b = face_b.normal.transform(member_b_tf).length
+        scale_b = 1.0 if scale_b < 1e-6
+        face_b.pushpull(push_b / scale_b)
+        puts "[CornerTool] PushPull B 完了: world=#{push_b.to_f.round(1)}in local=#{(push_b / scale_b).to_f.round(1)}in"
 
         # ──────────────────────────────────────────────────────────
         # Atomic Step 3: cutter_a 生成 → member_b をトリム → 参照を更新
@@ -328,7 +333,7 @@ module SuSmartFramingTools
         puts '[CornerTool] cutter_a.subtract(member_b) 実行中...'
         res_b  = cutter.subtract(member_b)     # 戻り値を明示的に受け取る
         cutter = nil
-        raise 'ブーリアン演算（部材B のトリム）が失敗しました' if res_b.nil?
+        raise "ブーリアン演算（部材B のトリム）が失敗しました。\n部材の小口（先端の面）を正しく選択できているか確認してください。" if res_b.nil?
         member_b = res_b
         raise '部材B のトリム結果が無効です' unless member_b.valid?
 
@@ -356,7 +361,7 @@ module SuSmartFramingTools
         puts '[CornerTool] cutter_b.subtract(member_a) 実行中...'
         res_a  = cutter.subtract(member_a)     # 戻り値を明示的に受け取る
         cutter = nil
-        raise 'ブーリアン演算（部材A のトリム）が失敗しました' if res_a.nil?
+        raise "ブーリアン演算（部材A のトリム）が失敗しました。\n部材の小口（先端の面）を正しく選択できているか確認してください。" if res_a.nil?
         member_a = res_a
         raise '部材A のトリム結果が無効です' unless member_a.valid?
 

@@ -280,6 +280,12 @@ module SuSmartFramingTools
       face.reverse! if face.normal.dot(plane_n) < 0
       face.pushpull(extend_dist)
 
+      unless manifold?(g)
+        puts '[GeometryHelper] build_half_space_cutter: 生成されたカッターがソリッドではありません'
+        g.erase! if g.valid?
+        return nil
+      end
+
       puts "[GeometryHelper] build_half_space_cutter: 完了 " \
            "dot=#{dot.round(2)} " \
            "extend_dist=#{extend_dist.to_f.round(1)}in " \
@@ -339,8 +345,18 @@ module SuSmartFramingTools
     #         [parent_entities, world_to_parent_local_tf]
     # ----------------------------------------------------------------
     def cutter_context(member, member_world_tf)
-      parent_world_tf = member_world_tf * member.transformation.inverse
-      [member.parent, parent_world_tf.inverse]
+      # 親階層のワールド変換:
+      #   member_world_tf = parent_world_tf * member.transformation
+      #   → parent_world_tf = member_world_tf * member.transformation⁻¹
+      #
+      # ワールド → 親ローカル変換:
+      #   world_to_parent_tf = (member_world_tf * member.transformation⁻¹)⁻¹
+      #
+      # これにより任意のネスト深度で「カッターとターゲットを同じ Entities に生成」できる。
+      # トップレベル部材では parent_world_tf = I（単位行列）→ world_to_parent_tf = I
+      # グループ内部材では parent_world_tf = group_tf → world_to_parent_tf = group_tf⁻¹
+      world_to_parent_tf = (member_world_tf * member.transformation.inverse).inverse
+      [member.parent, world_to_parent_tf]
     end
   end
 end

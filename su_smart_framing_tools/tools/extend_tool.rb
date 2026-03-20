@@ -260,8 +260,12 @@ module SuSmartFramingTools
         raise '延長対象の面を取得できませんでした（make_unique 後）' if face.nil?
 
         # ---- ③ face のワールド座標を取得 ----------------------------
-        face_center_world = face.bounds.center.transform(target_entity_tf)
-        face_normal_world = face.normal.transform(target_entity_tf)
+        face_center_world    = face.bounds.center.transform(target_entity_tf)
+        # スケール補正: 変換前の長さ（= ローカル→ワールドのスケール倍率）を記録してから正規化
+        face_normal_world_raw = face.normal.transform(target_entity_tf)
+        face_normal_scale     = face_normal_world_raw.length
+        face_normal_scale     = 1.0 if face_normal_scale < 1e-6
+        face_normal_world     = face_normal_world_raw.clone
         face_normal_world.normalize!
 
         b_n  = @boundary_cut_info[:normal]   # ワールド境界法線
@@ -286,8 +290,9 @@ module SuSmartFramingTools
         # 正値 = face_normal 方向へ押し出し（外向き延伸）。
         # t > 0 でも t ≤ 0 でも overshoot_dist > 0 を使えば
         # 境界を突き抜けた状態が保証される。
-        face.pushpull(overshoot_dist)
-        puts '[ExtendTool] execute_extend: PushPull 完了'
+        # ワールド距離をローカル距離に変換（スケール補正）してから pushpull
+        face.pushpull(overshoot_dist / face_normal_scale)
+        puts "[ExtendTool] execute_extend: PushPull 完了 world=#{overshoot_dist.to_f.round(1)}in local=#{(overshoot_dist / face_normal_scale).to_f.round(1)}in"
 
         # ---- ⑥ waste_click_pt を算出（境界より先の廃棄領域に置く）--
         # build_half_space_cutter がカッターを「waste 側」に生成するための
@@ -307,7 +312,7 @@ module SuSmartFramingTools
         puts '[ExtendTool] execute_extend: cutter.subtract(target) 実行中...'
         result = cutter.subtract(target_entity)
         cutter = nil   # subtract 成功時は API が cutter を自動削除済み
-        raise 'ブーリアン演算（境界でのトリム）が失敗しました' if result.nil?
+        raise "ブーリアン演算（境界でのトリム）が失敗しました。\n部材の小口（先端の面）を正しく選択できているか確認してください。" if result.nil?
 
         # ---- ⑧ 共面エッジのクリーンアップ & コミット ---------------
         cleanup_coplanar_edges(result)
