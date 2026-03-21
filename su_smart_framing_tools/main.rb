@@ -8,9 +8,9 @@
 # 依存ファイルの読み込みと、メニュー・ツールバー・コンテキストメニューの登録を行う。
 #
 # ■ 登録内容
-#   - Plugins メニュー > Smart Framing Tools サブメニュー（5 コマンド）
-#   - UI::Toolbar "Smart Framing Tools"（5 コマンド、アイコンは icons/ に置けば自動適用）
-#   - 右クリックコンテキストメニュー > Smart Framing Tools サブメニュー（5 コマンド）
+#   - Plugins メニュー > Smart Framing Tools サブメニュー（4 コマンド）
+#   - UI::Toolbar "Smart Framing Tools"（4 コマンド、アイコンは icons/ に置けば自動適用）
+#   - 右クリックコンテキストメニュー > Smart Framing Tools サブメニュー（4 コマンド）
 
 module SuSmartFramingTools
   # 依存ファイルを require（Ruby の require キャッシュにより重複ロードなし）
@@ -19,7 +19,6 @@ module SuSmartFramingTools
   require File.join(dir, 'tools', 'trim_tool')
   require File.join(dir, 'tools', 'split_tool')
   require File.join(dir, 'tools', 'align_tool')
-  require File.join(dir, 'tools', 'corner_tool')
   require File.join(dir, 'tools', 'extend_tool')
 
   unless file_loaded?(__FILE__)
@@ -41,7 +40,6 @@ module SuSmartFramingTools
       { label: 'トリム (Trim)',       icon: 'trim',   klass: TrimTool   },
       { label: '分割 (Split)',        icon: 'split',  klass: SplitTool  },
       { label: '位置合わせ (Align)',  icon: 'align',  klass: AlignTool  },
-      { label: '包絡 (Corner)',       icon: 'corner', klass: CornerTool },
       { label: '延長 (Extend)',       icon: 'extend', klass: ExtendTool },
     ].freeze
 
@@ -96,7 +94,7 @@ module SuSmartFramingTools
 
     # ----------------------------------------------------------------
     # 右クリックコンテキストメニュー登録
-    # "Smart Framing Tools" サブメニューとして全5ツールを追加する。
+    # "Smart Framing Tools" サブメニューとして全4ツールを追加する。
     # ----------------------------------------------------------------
     UI.add_context_menu_handler do |menu|
       sub = menu.add_submenu('Smart Framing Tools')
