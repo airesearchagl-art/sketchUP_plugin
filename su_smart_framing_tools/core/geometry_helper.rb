@@ -356,7 +356,7 @@ module SuSmartFramingTools
       # トップレベル部材では parent_world_tf = I（単位行列）→ world_to_parent_tf = I
       # グループ内部材では parent_world_tf = group_tf → world_to_parent_tf = group_tf⁻¹
       world_to_parent_tf = (member_world_tf * member.transformation.inverse).inverse
-      [member.parent, world_to_parent_tf]
+      [member.parent.entities, world_to_parent_tf]
     end
   end
 end
